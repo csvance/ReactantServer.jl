@@ -1,305 +1,109 @@
 # ReactantServer.jl
 
-A production inference server that serves models compiled through Reactant.jl — StableHLO via
-XLA today — from a single Julia process, built on Reactant's PJRT bindings. It targets static-graph workloads (computer vision,
-scientific computing) where many models share one GPU and only one model executes at a time.
-To serve more models than fit in GPU memory at once, it keeps every model's weights resident
-in host RAM and transfers them onto the GPU on demand, evicting cold models under a memory
-budget. It speaks the KServe V2 inference API natively over gRPC, so standard Triton/KServe
-clients connect to it directly.
+A production inference server for XLA-accelerated models, compiled through Reactant.jl
+(StableHLO via XLA today). It speaks the KServe V2 inference API natively over gRPC, so standard
+Triton and KServe clients connect unchanged; it scales from a single GPU to many from one
+container; and it squeezes the most models out of each GPU by balancing model **memory** against
+**compute**. It is Julia-first throughout — custom pre/postprocessing is plain Julia, and every
+convention follows Julia's (column-major, batch-last axes).
 
-For a high-level overview of the goals and the scheduler, see
-[docs/src/design/architecture.md](docs/src/design/architecture.md); for the mission and
-non-goals, [docs/src/design/philosophy.md](docs/src/design/philosophy.md).
+It targets static-graph workloads — computer vision, scientific computing — where many models
+share a GPU and one model executes at a time.
 
-## Repository layout
+## Highlights
 
-A Julia 1.11 workspace of five packages under `packages/`, plus the non-member
-`ReactantServerExport`:
+- **XLA-accelerated, Reactant-compiled.** Models are compiled ahead of time into device
+  executables through Reactant's PJRT bindings. The runtime is device-agnostic (CUDA today, CPU
+  for dev/fallback); supporting more accelerators is a goal, not a redesign. → [Architecture](docs/src/design/architecture.md), [Philosophy](docs/src/design/philosophy.md)
+- **Julia-first pre/postprocessing.** A bundle's `model.jl` registers `preprocess`/`postprocess`
+  hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](docs/src/manual/bundles.md)
+- **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
+  and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
+  clients are unchanged and you never reason about row-major order. → [Getting Started](docs/src/manual/getting_started.md)
+- **Elegant configuration.** One typed YAML node file (with environment-variable overrides)
+  describes a machine; manifests declare tensors with an einsum-style named-axis notation. → [Node Configuration](docs/src/manual/node_config.md), [Bundles & model.jl](docs/src/manual/bundles.md)
+- **Standard inference protocol.** KServe V2 over gRPC. Tensor data travels inline or through the
+  Triton-compatible system-shared-memory extension for zero-copy local clients. → [Client Usage](docs/src/manual/client_usage.md)
+- **One container, single or multi-GPU.** A node supervisor runs one worker per visible GPU: a
+  single worker serves the public ports directly; two or more get an embedded gateway behind one
+  endpoint. The external interface (`:8001` gRPC, `:8002` metrics/health) is identical either way.
+  → [Docker Deployment](docs/src/manual/docker.md), [Scaling to Multiple GPUs](docs/src/manual/scaling.md)
+- **Balances memory and compute.** Every model's weights stay resident in host RAM and stream
+  onto the GPU on demand, evicted LRU under a byte budget — so a card serves far more models than
+  fit in VRAM, paying a single host-to-device transfer on a cold call. → [On-demand Weights](docs/src/manual/on_demand_weights.md)
+- **Batch coalescing.** Concurrent same-model requests are merged into one execution at a compiled
+  batch size, amortizing per-launch overhead and the one-time weight transfer across the batch.
+  → [Architecture](docs/src/design/architecture.md)
+- **Scheduling modes for single and multi-GPU.** On a worker, `fair` (deficit-weighted,
+  cost-aware) or `fifo`; across GPUs, the gateway offers `round_robin` or memory-aware
+  `lpt_packing` that concentrates each model's traffic to fill batches. → [Architecture](docs/src/design/architecture.md), [Multi-GPU Gateway](docs/src/manual/multi_gpu_gateway.md)
+- **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
+  unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
+  restart (`static` and `explicit` control modes are also available). → [Node Configuration](docs/src/manual/node_config.md)
 
-- **`ReactantServerCore`** — the shared, Reactant-free substrate: dtypes, the KServe V2 protobuf
-  messages, boundary types, the manifest parser, server/node config, the wire codec, the
-  shared-memory registry, and the concurrency-safe staging `BufferPool`.
-- **`ReactantServer`** — the inference worker: registry, runtime, scheduler, and KServe V2 gRPC
-  server. The **only** package that depends on Reactant. Exports `serve`, `serve_worker`,
-  `stop!`, `register_model`.
-- **`ReactantServerGateway`** — the multi-GPU KServe gRPC reverse proxy (`serve_gateway`,
-  `probe_worker_ready`). No Reactant.
-- **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`,
-  `infer_sync`, `infer_async`, `InferInput`, `InferOutput`).
-- **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects the
-  visible GPUs, runs one worker subprocess per device (plus an embedded gateway when there is
-  more than one worker; a single worker serves the public ports directly), multiplexes their
-  logs with `[name]` line prefixes, and restarts children that die. No Reactant.
+## Quick start
 
-Offline model-export tooling is `packages/ReactantServerExport` (the bundle writer plus the
-Reactant tracing frontend; PyTorch support is a package extension that loads when `PythonCall`
-is present). It is deliberately not a workspace member, so its Lux/PythonCall weakdeps stay out
-of the server images. The vendored forks/unregistered deps (`Reactant`, `gRPCServer`,
-`gRPCClient`, `HTTP`) are git submodules under `lib/`.
-
-## Status: core serving path implemented
-
-This repository implements a complete path through every layer: load a StableHLO model bundle
-from disk, compile it through Reactant/PJRT, schedule and serve it over the KServe V2 gRPC
-control plane, and return a result. The cost-aware coalescing scheduler and the on-demand GPU
-weight cache are both implemented (see below). The runtime is device agnostic; it defaults to
-CPU PJRT and selects CUDA through configuration, with CPU fallback.
-
-Beyond GPU is a goal, not a limitation of the design. Because the runtime sits on Reactant's PJRT
-bindings, any accelerator Reactant can target (other PJRT plugins, e.g. TPU, and additional
-backends as they mature) is reachable through the same device-agnostic path; the on-demand
-host-to-device weight tiering and the single-executes-at-a-time scheduler are not GPU-specific.
-GPU is simply the most common deployment, so this initial release focuses on it (CUDA, with CPU
-for development and fallback). Support for more accelerators is intended to follow.
-
-What works today:
-
-- StableHLO bundle loading, manifest parsing and validation, and a typed YAML configuration
-  with environment-variable overrides.
-- The Reactant/PJRT runtime: deserialize a portable artifact, compile with weights bound as
-  explicit arguments, execute, and read results back. A single shared memory pool backs all
-  models.
-- On-demand GPU weight loading with a host-RAM weight cache. With the cache enabled
-  (`runtime.weight_cache_bytes > 0`), every model's weights default to system-pinned: they are
-  materialized into host RAM at startup, transferred to the GPU on first request, kept resident
-  for reuse, and evicted under the configured GPU byte budget (least-recently-used) with an
-  immediate PJRT buffer free. Models can be pinned to stay GPU-resident
-  (`scheduler.models.<name>.residency: device`, or the back-compat alias `pin_to_gpu: true`)
-  or opted out of the host floor (`residency: unpinned`, which re-materializes from the mmap on
-  each load). Because the weights are already in RAM, an on-demand load is a single
-  host-to-device transfer, tens of milliseconds even for the largest models. Setting
-  `weight_cache_bytes` to 0 keeps every model resident (the original behavior). This decouples
-  the number of servable models from GPU memory capacity.
-- The scheduler: a deficit-weighted, cost-aware, coalescing dispatch policy. Concurrent
-  requests land on per-model queues; a single dispatch loop runs one execution at a
-  time, coalesces same-model requests into one batched execution at a compiled size, and shares
-  GPU time across models by relative weight and a learned per-batch-size cost estimate.
-  Per-model latency budgets (earliest-deadline-first escalation) are planned but not yet
-  implemented. Per-model metrics (dispatch count, compute, queue-wait percentiles, coalesced
-  batch-size histogram) and weight cache residency counters are exposed.
-- Model lifecycle control (`model_control_mode`): `dynamic` (the default) watches the model
-  repository and loads new bundles, unloads removed ones, and reloads changed ones online,
-  covering weights, MLIR, manifest, and `model.jl` changes with a two-poll debounce; `static`
-  fixes the startup set; `explicit` cedes lifecycle and residency to an external control plane
-  via the worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`).
-- Gateway scheduling (`scheduling.mode`): `round_robin` spreads each model's requests uniformly
-  across replicas; `lpt_packing` places models on workers adaptively with memory-aware LPT bin
-  packing, concentrating each model's traffic for batch coalescing while balancing measured
-  compute demand and resident weight footprint per GPU, rebalanced from live measurements
-  (requires `fifo` workers; verified at startup).
-- The KServe V2 control plane over gRPC: server and model liveness/readiness, model and server
-  metadata, inference, and a `RepositoryIndex` that lists the models a worker has loaded (for
-  direct client introspection). Tensor data travels either
-  inline (`raw_input_contents` / `raw_output_contents`) or through the Triton-compatible system
-  shared-memory extension. The gRPC transport is provided by gRPCServer.jl (HTTP/2); the codec,
-  scheduler, and runtime are transport-agnostic.
-- The system shared-memory data plane: clients register a POSIX region
-  (`SystemSharedMemoryRegister` / `Unregister` / `Status`) and reference it from input and
-  output tensors via the `shared_memory_region` / `shared_memory_offset` /
-  `shared_memory_byte_size` parameters. The server attaches the region with
-  InterProcessCommunication.jl, copies inputs into host arrays, and writes outputs back into
-  client-provided regions.
-- Multiple compiled batch sizes per model. A bundle may carry one static module per size
-  (`model.b{N}.mlir`) alongside a single shared `weights.safetensors`; the server compiles
-  each and selects the matching executable per request. A lone `model.mlir` (single size)
-  remains supported.
-- Custom per-model pre/post-processing via a bundle's `model.jl`, which calls `register_model`
-  with `preprocess` and `postprocess` hooks. The scheduler runs them around each dispatch
-  (crossing the world-age boundary with `invokelatest`); omitted hooks default to identity.
-- Offline conversion tooling in `packages/ReactantServerExport` (not part of the server
-  runtime): `export_bundle` traces a Reactant model (or any Reactant-traceable function) into a
-  bundle, the PythonCall-triggered extension adds `export_bundle`/`export_torchscript_bundle` for
-  a `torch.nn.Module` via `torch.export` + torchax, and `write_bundle` is the shared bundle-format
-  writer. All frontends re-trace once per requested batch size.
-
-Deferred to later milestones (each has a seam in the current code): dynamic-batch export
-with server-side `stablehlo-refine` specialization (so a single MLIR module covers many
-sizes); the compiled-executable disk cache; CUDA (device) shared memory; multi-model
-orchestrators; and full StableHLO-signature validation of manifests.
-
-## Deployment: one container, any number of GPUs
-
-The recommended deployment is the unified `reactantserver` image, whose entrypoint is the node
-supervisor (`ReactantServerNode`). It detects every GPU granted to the container, spawns one
-single-GPU worker subprocess per device, multiplexes all logs onto the container's stdout with
-`[worker0]` / `[gateway]` line prefixes, and restarts children that die. With two or more
-workers it also runs an embedded gateway on the public ports; with a single worker it skips the
-gateway and binds that worker to the public ports directly. A multi-GPU deployment is therefore
-a single container with no per-GPU configuration:
+Serve a directory of model bundles from one container (scales to all visible GPUs):
 
 ```
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
   -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
 ```
 
-Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. See `docker/README.md`
-for configuration, roles, and metrics.
-
-Underneath, each worker is a single Julia process that drives one GPU and serves the complete
-KServe V2 gRPC surface on its own. For a single-GPU deployment that is all the supervisor runs:
-one worker bound to the public ports, no gateway.
-
-The gateway reverse proxy exists for **multi-GPU configurations**. Because a worker hosts one
-GPU and executes one model at a time, scaling across several GPUs means running one worker per
-GPU and spreading models across them, and the supervisor then runs an embedded gateway that gives
-clients a single gRPC endpoint and routes each `ModelInferRequest` to a worker serving the
-requested model, forwarding the protobuf bytes unchanged. Replica scheduling is set by
-`scheduling.mode`: `round_robin` (the default) spreads requests uniformly, while `lpt_packing`
-derives an adaptive memory-aware placement from live measurements, concentrating each model's
-traffic so worker-side batch coalescing fills (it requires workers running the `fifo` scheduler
-discipline). The supervisor configures the embedded gateway automatically from the node file; it
-autodiscovers which models each worker serves via `RepositoryIndex` and refreshes its routing
-table periodically. The gateway is pure Julia, in its own `ReactantServerGateway` package
-(`ReactantServerGateway.serve_gateway`); see `docs/src/manual/multi_gpu_gateway.md`.
-
-## Shape convention (Julia-centric, zero-copy interop)
-
-Shape declarations in `manifest.yaml` and the server's internal `NamedTensor.data` use the
-Julia column-major convention (Lux convention: the batch dimension is the last axis). A
-Lux `Dense(4 => 8)` input thus appears as `shape: "cn", dims: {c: 4}`, which is the reverse
-of how Python/XLA writes the same tensor. The codec advertises and accepts KServe V2 wire
-shapes in their canonical row-major form, so Triton-style clients are unchanged; the
-underlying tensor bytes are the same memory under either view, and the codec converts by
-reshaping rather than permuting. This is the standard column-major / row-major interop
-trick, applied at the wire boundary.
-
-The Julia client (`ReactantServerClient`) presents Julia column-major shapes throughout, so a
-Julia user never reasons about the row-major wire order. You build and read arrays in their
-natural Julia shape, you declare input and output shapes in Julia order, and introspection
-(`model_io_spec` / `manifest_io_spec`) reports shapes in Julia order too, matching the manifest's
-einsum letters. The reversal to KServe's row-major wire happens internally, only at the wire
-boundary.
-
-Shapes use an einsum-style notation: each axis is a single ASCII letter and the companion
-`dims:` map gives the size of every non-batch letter. Letters `n` and `b` are reserved for
-the batch axis (at most one occurrence per tensor); other letter names are tensor-scoped
-and carry no implicit equality across tensors. A size of `-1` in `dims` marks a variable
-non-batch axis (used today only in `client_outputs` that pass through `model.jl`). The
-per-input batch axis is derived from the position of `n` (or `b`) in each input's shape
-string; at inference the request's size along that axis must equal one of
-`batching.compiled_batch_sizes`.
-
-## Conversion tooling (ReactantServerExport)
-
-`ReactantServerExport` produces bundles offline and is kept out of the server's dependency
-graph. A project that owns a Lux model (or any Reactant-traceable function) adds
-`ReactantServerExport` (`Pkg.develop`) and calls `export_bundle`; Lux is not required by the
-package:
-
-```julia
-using ReactantServerExport
-export_bundle(:lux, model, ps, st, example_input;
-    dir="bundles/mlp", name="mlp", batch_sizes=[1, 8])
-```
-
-A PyTorch project additionally loads `PythonCall`, which triggers the package extension that
-drives `torch.export.export` and torchax:
-
-```julia
-using ReactantServerExport, PythonCall
-export_bundle(:pytorch, model, (example_input,);
-    dir="bundles/mlp", name="mlp", batch_sizes=[1, 8])
-# TorchScript artifacts: export_torchscript_bundle(pt_path, (example_input,); ...)
-```
-
-Both frontends trace once per batch size and write a server-loadable bundle. The batch
-dimension is the last Julia axis (i.e. the leading PyTorch axis after row-major / column-major
-reversal). Run the round-trip tests with
-`julia --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl`;
-the PyTorch portion skips gracefully when `torch` / `torchax` are unavailable.
-
-## Running
-
-```julia
-using ReactantServer
-ReactantServer.serve("docker/node.yaml")                      # single worker: name optional
-ReactantServer.serve("docker/node.yaml"; worker="worker0")    # multi-worker: name the worker
-```
-
-Configuration is a single node file (see `docker/node.yaml`) that describes one machine's
-single-GPU workers, a shared model repository, and a base port. `serve` resolves this process's
-worker from that file: global settings are merged with the worker's overrides, the listen port
-is derived from `base_port`, and the device ordinal from the worker's `gpu`. Every worker loads
-(and can serve) every bundle in the repository; the optional top-level `models:` map only pins
-the named models to device memory on the listed workers. The `worker` keyword selects the
-entry; it may be omitted when the node has exactly one worker.
-
-`serve` loads the configuration, brings up the runtime client, compiles the bundles assigned
-to the worker, starts the scheduler, and then starts the gRPC server. Pass `blocking=false` to
-run it in the background and receive a handle that `stop!` shuts down. Pass
-`backend=ReactantServer.ReactantBackend()` (the default) for real execution. Any KServe V2 gRPC
-client can then call the server directly at the configured host and port.
-
-For a multi-GPU deployment, the supervisor does the fan-out for you:
+Or from pure Julia:
 
 ```julia
 using ReactantServerNode
-ReactantServerNode.supervise("docker/node.yaml")   # one worker per visible GPU (+ gateway if >1)
+ReactantServerNode.supervise("docker/node.yaml")   # one worker per GPU (+ gateway if >1)
 ```
 
-It synthesizes the worker list when the node file has none (`gpus: auto`) and spawns each worker
-as a subprocess pinned to its device via `CUDA_VISIBLE_DEVICES`. With more than one worker it
-also runs the embedded gateway, which routes by model name and load-balances replicated models;
-a single worker serves clients directly. To call a server from Julia, use the Reactant-free
-`ReactantServerClient` package (`KServeModel` + `infer_sync`). See `docker/` for the container
-setup and `docs/` for the Getting Started and Scaling guides.
+Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. Walk through exporting
+a model, configuring a node, and querying it in [Getting Started](docs/src/manual/getting_started.md).
+ReactantServer is designed for a trusted network — read
+[Security](docs/src/manual/docker.md#security) before exposing an endpoint.
 
-A bundle is a directory containing `manifest.yaml`, `model.mlir` (a serialized StableHLO
-portable artifact), `weights.safetensors`, and an optional `model.jl`. Bundles are produced by
-offline conversion tooling; the test suite builds small bundles directly (see
-`packages/ReactantServer/test/stablehlo_fixtures.jl`).
+## Status
 
-## Security posture
+The full serving path is implemented end to end: export a bundle, compile it through Reactant/PJRT,
+schedule and coalesce requests, and serve over the KServe V2 gRPC control plane. The cost-aware
+scheduler, the on-demand GPU weight cache, dynamic model lifecycle, and the single- and multi-GPU
+deployment paths all work today on CUDA (with CPU for development and fallback); broader accelerator
+support is intended to follow. Deferred to later milestones: dynamic-batch export with server-side
+`stablehlo-refine` specialization, the compiled-executable disk cache, CUDA (device) shared memory,
+multi-model orchestrators, and full StableHLO-signature validation of manifests. See
+[Architecture](docs/src/design/architecture.md) for the full picture.
 
-ReactantServer is designed to run on a trusted network behind your own perimeter. Be aware of
-the following before exposing any endpoint:
+## Repository layout
 
-- All gRPC traffic (worker and gateway) is cleartext h2c. TLS settings are parsed by the
-  gateway config but not yet enforced; a configured cert triggers a startup warning.
-- There is no authentication or authorization on the KServe data plane, the worker
-  control-plane RPCs (residency and policy), or the gateway's Prometheus metrics listener
-  (which binds `0.0.0.0:8002` by default).
-- Model bundles are trusted input: a bundle's optional `model.jl` executes arbitrary Julia in
-  the server process. Only serve bundles you built or audited.
-- POSIX shared memory is a local trust boundary. Client-registered regions and the optional
-  node-shared host-weight store live in `/dev/shm`; the shared weight regions default to mode
-  `666` (world-writable) for cross-container friction-free sharing. Set
-  `runtime.shared_host_weights_mode: "660"` on production or multi-user systems.
+A Julia 1.11+ workspace of five packages under `packages/`, split so that talking to a server never
+pulls in the heavy Reactant/XLA stack:
 
-## Testing
+- **`ReactantServerCore`** — shared, Reactant-free substrate: dtypes, the KServe V2 protobuf
+  messages, boundary types, the manifest parser, node config, the wire codec, the shared-memory
+  registry, and the staging `BufferPool`.
+- **`ReactantServer`** — the inference worker (registry, runtime, scheduler, KServe V2 gRPC server);
+  the **only** package that depends on Reactant. Exports `serve`, `stop!`, `register_model`.
+- **`ReactantServerGateway`** — the multi-GPU KServe gRPC reverse proxy (`serve_gateway`). No Reactant.
+- **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`, `infer_sync`,
+  `infer_async`, `InferInput`, `InferOutput`).
+- **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects GPUs, runs
+  one worker per device, embeds the gateway when there is more than one, and multiplexes their logs.
 
-Each package is tested in its own environment; all tests run on CPU and need no GPU:
+Offline model export lives in `packages/ReactantServerExport` (a Reactant tracing frontend plus a
+PythonCall-triggered PyTorch extension); it is deliberately **not** a workspace member, so its
+Lux/PythonCall weakdeps stay out of the server images. The vendored forks/unregistered deps
+(`Reactant`, `gRPCServer`, `gRPCClient`, `HTTP`) are git submodules under `lib/`.
 
-```
-julia --project=packages/ReactantServerCore   -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServer        -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServerClient  -e 'using Pkg; Pkg.test()'
-julia --project=packages/ReactantServerNode    -e 'using Pkg; Pkg.test()'
-```
+## Documentation
 
-`packages/ReactantServer/test/spike_reactant.jl` is a standalone script that exercises the
-Reactant runtime path in isolation.
-
-## Protobuf bindings
-
-The KServe V2 messages and gRPC service stubs in
-`packages/ReactantServerCore/src/proto/inference/` are generated from
-`proto_src/grpc_predict_v2.proto` with ProtoBuf.jl. Load gRPCServer and gRPCClient alongside
-ProtoBuf so both the server method builders / `register_GRPCInferenceService!` and the client
-constructors are emitted, and keep `add_kwarg_constructors=true` (the handlers and codec build
-messages with keyword arguments):
-
-```julia
-using ProtoBuf, gRPCServer, gRPCClient
-ProtoBuf.protojl("grpc_predict_v2.proto", "proto_src", "packages/ReactantServerCore/src/proto";
-    always_use_modules=true, add_kwarg_constructors=true)
-```
-
-The generated file is then split so `ReactantServerCore` compiles only the messages (no gRPC
-dependency): the messages stay in `grpc_predict_v2_pb.jl`, while the gRPCClient and gRPCServer
-service stubs are extracted into `grpc_client_stubs.jl` and `grpc_server_stubs.jl`, which
-`ReactantServerCore` ships but does not compile. Each consumer includes the stub file it needs
-(client stubs in the client and gateway; server stubs in the worker and gateway) via
-`ReactantServerCore.inference_client_stubs_path()` / `inference_server_stubs_path()`.
+- [Getting Started](docs/src/manual/getting_started.md) — export a model, configure a node, serve and query it.
+- [Scaling to Multiple GPUs](docs/src/manual/scaling.md) — add GPUs and how the supervisor decides what to run.
+- [Client Usage](docs/src/manual/client_usage.md) — the Julia client, batched inference, and IO validation.
+- [Node Configuration](docs/src/manual/node_config.md) — the full node-file surface and environment overrides.
+- [Bundles & model.jl](docs/src/manual/bundles.md) — the bundle format, manifest shapes, and pre/postprocessing.
+- [On-demand Weights](docs/src/manual/on_demand_weights.md) — serving more models than fit in GPU memory.
+- [Multi-GPU Gateway](docs/src/manual/multi_gpu_gateway.md) — routing, scheduling modes, and operations.
+- [Docker Deployment](docs/src/manual/docker.md) — the image, roles, health, metrics, and [Security](docs/src/manual/docker.md#security).
+- Design: [Philosophy](docs/src/design/philosophy.md) (mission, audience, non-goals) and [Architecture](docs/src/design/architecture.md) (how it fits together, the scheduler, the compiler advantage).
+- [`docker/README.md`](docker/README.md) — the container deployment reference.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — running the tests and regenerating the protobuf bindings.

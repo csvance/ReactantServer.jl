@@ -143,3 +143,20 @@ and watch for memory leaks. It pins a persistent XLA compile-cache volume so war
 recompilation, and `docker/monitor_gpu2.sh` logs GPU memory and container RSS to a CSV for leak
 detection. Because it runs the production single-GPU container, the soak tests exactly what users
 deploy.
+
+## Security
+
+ReactantServer is designed to run on a trusted network behind your own perimeter. Be aware of the
+following before exposing any endpoint:
+
+- All gRPC traffic (worker and gateway) is cleartext h2c. TLS settings are parsed by the gateway
+  config but not yet enforced; a configured cert triggers a startup warning.
+- There is no authentication or authorization on the KServe data plane, the worker control-plane
+  RPCs (residency and policy), or the Prometheus metrics listener (which binds `0.0.0.0:8002` by
+  default).
+- Model bundles are trusted input: a bundle's optional `model.jl` executes arbitrary Julia in the
+  server process. Only serve bundles you built or audited.
+- POSIX shared memory is a local trust boundary. Client-registered regions and the optional
+  node-shared host-weight store live in `/dev/shm`; the shared weight regions default to mode `666`
+  (world-writable) for cross-container friction-free sharing. Set
+  `runtime.shared_host_weights_mode: "660"` on production or multi-user systems.
