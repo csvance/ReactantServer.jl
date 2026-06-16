@@ -1,22 +1,32 @@
-# ReactantServer.jl single-GPU worker image.
+# ReactantServer.jl unified node image. The default entrypoint is the supervisor
+# (ReactantServerNode): it detects the visible GPUs, runs one worker subprocess per device plus
+# the embedded gateway, and multiplexes their logs, so a multi-GPU deployment is just
+#
+#   docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
+#     -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
+#
+# Roles for multi-node setups (REACTANT_ROLE=all|workers|gateway) and the single-worker
+# entrypoint.worker.sh escape hatch are documented in docker/README.md.
 #
 # Build context is the repository root. The vendored dependencies are git submodules under
 # lib/ (Reactant.jl, gRPCServer.jl, gRPCClient.jl, HTTP.jl); run
 # `git submodule update --init --recursive` before building.
 #
 # Build (from the repo root):
-#   docker build -f docker/Dockerfile.worker -t reactantserver-worker .
+#   docker build -f docker/Dockerfile.worker -t reactantserver .
 
 FROM docker.io/library/julia:1.12.5-trixie
 
 ENV JULIA_DEPOT_PATH=/opt/julia-depot \
-    JULIA_PROJECT=/opt/reactantserver
+    JULIA_PROJECT=/opt/reactantserver \
+    REACTANT_WORKSPACE_ROOT=/opt/reactantserver
 
 # git/CA certs for the General registry and artifact downloads during instantiate;
 # build-essential (make + C toolchain) so packages with a native build step, e.g.
-# InterProcessCommunication.jl, can compile their helpers.
+# InterProcessCommunication.jl, can compile their helpers; tini as PID 1 (zombie reaping and
+# conventional signal semantics under the supervisor); curl for the gateway-backed healthcheck.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git ca-certificates build-essential \
+ && apt-get install -y --no-install-recommends git ca-certificates build-essential tini curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/reactantserver
@@ -67,15 +77,35 @@ RUN mkdir -p /tmp/cudastub && : > /tmp/empty.c \
  && LD_LIBRARY_PATH=/tmp/cudastub julia --project=/opt/reactantserver -e 'using Pkg; Pkg.Registry.add("General"); Pkg.resolve(); Pkg.instantiate(); Pkg.precompile()' \
  && rm -rf /tmp/cudastub /tmp/empty.c
 
+# entrypoint.node.sh is the default (supervisor: workers + embedded gateway);
+# entrypoint.worker.sh remains as the single-worker escape hatch for per-GPU-container layouts.
+COPY docker/entrypoint.node.sh   /usr/local/bin/entrypoint.node.sh
 COPY docker/entrypoint.worker.sh /usr/local/bin/entrypoint.worker.sh
-RUN chmod +x /usr/local/bin/entrypoint.worker.sh
+RUN chmod +x /usr/local/bin/entrypoint.node.sh /usr/local/bin/entrypoint.worker.sh
 
-# Pure-Julia readiness probe invoked by the container healthcheck. It imports only gRPCClient and
-# YAML (never ReactantServer), so it does not pay the Reactant load on every probe.
+# Healthchecks: healthcheck.node.sh dispatches on REACTANT_ROLE (curl on the gateway's /readyz
+# for all/gateway; the pure-Julia ServerReady probe, which imports only gRPCClient and YAML, for
+# workers).
+COPY docker/healthcheck.node.sh   /usr/local/bin/healthcheck.node.sh
 COPY docker/healthcheck.worker.jl /usr/local/bin/healthcheck.worker.jl
+RUN chmod +x /usr/local/bin/healthcheck.node.sh
 
-# The gRPC listen port is derived from the cluster file (base_port + worker index); this is
-# informational. No system CUDA toolkit is installed: Reactant supplies the PJRT plugin via
-# JLLs and only needs the host driver, exposed by the NVIDIA container runtime.
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/entrypoint.worker.sh"]
+# Baked default node config: gpus auto, no workers list (synthesized per detected GPU). Mount
+# your own file over this path to customize.
+COPY docker/node.default.yaml /etc/reactantserver/node.yaml
+
+# 8001/8002: the embedded gateway's client gRPC and metrics/health admin ports (the default
+# all-in-one role). In the workers role the per-worker ports (base_port+i, default 8080..) and
+# metrics ports (9100..) are bound instead; publish the range you configured. No system CUDA
+# toolkit is installed: Reactant supplies the PJRT plugin via JLLs and only needs the host
+# driver, exposed by the NVIDIA container runtime.
+EXPOSE 8001 8002
+
+# start_period is generous because every model compiles (Reactant -> device executable) before
+# the gRPC plane accepts traffic; raise it for large model sets.
+HEALTHCHECK --interval=30s --timeout=20s --retries=3 --start-period=300s \
+  CMD ["/usr/local/bin/healthcheck.node.sh"]
+
+# tini reaps zombies and keeps signal semantics conventional; the supervisor itself installs
+# SIGTERM/SIGINT handlers and shuts its children down gracefully.
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.node.sh"]

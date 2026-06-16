@@ -12,6 +12,7 @@ projects = [
     "packages/ReactantServer",
     "packages/ReactantServerGateway",
     "packages/ReactantServerClient",
+    "packages/ReactantServerNode",
 ]
 
 [deps]

@@ -64,5 +64,6 @@ end
     entry = _obs_entry("scale", _obs_model([1, 4]; weights=Any[1], nbytes=2048, state=PINNED_SYSTEM))
     @test_logs (:info, "model loaded") log_model_loaded(entry, entry.executable; source=:startup, memory="device n/a")
     @test_logs (:info, "model unloaded") log_model_unloaded("scale", 2048; memory="device n/a")
-    @test_logs (:info, "residency: model moved") log_residency_change("scale", PINNED_SYSTEM, PINNED_DEVICE, 2048; memory="device n/a")
+    # Residency moves are request-path churn and log at debug level only.
+    @test_logs min_level = Base.CoreLogging.Debug (:debug, "residency: model moved") log_residency_change("scale", PINNED_SYSTEM, PINNED_DEVICE, 2048; memory="device n/a")
 end

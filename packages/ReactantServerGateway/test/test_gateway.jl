@@ -205,3 +205,102 @@ end
         rm(gatewayfile; force = true)
     end
 end
+
+@testset "env-only gateway config (no gateway.yml)" begin
+    # The node supervisor starts an embedded gateway with no config file: defaults plus
+    # REACTANT_GATEWAY_* environment variables, with the endpoint list synthesized into
+    # REACTANT_GATEWAY_WORKERS.
+    withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080,127.0.0.1:8081",
+            "REACTANT_GATEWAY_LISTEN_GRPC" => "0.0.0.0:9001") do
+        cfg = ReactantServerGateway.load_gateway(nothing)
+        @test cfg.workers == ["127.0.0.1:8080", "127.0.0.1:8081"]
+        @test cfg.listen_grpc == "0.0.0.0:9001"
+        @test cfg.listen_metrics == "0.0.0.0:8002"       # default
+    end
+
+    # Without an endpoint list the env-only path keeps the existing guard.
+    withenv("REACTANT_GATEWAY_WORKERS" => nothing) do
+        @test_throws ReactantServerCore.ConfigError ReactantServerGateway.load_gateway(nothing)
+    end
+
+    # An explicit path that does not exist still fails loudly.
+    @test_throws ReactantServerCore.ConfigError ReactantServerGateway.load_gateway(tempname())
+end
+
+@testset "metrics aggregation" begin
+    @testset "merge_expositions" begin
+        gw = """
+        # HELP gateway_requests_total Count of gateway RPCs.
+        # TYPE gateway_requests_total counter
+        gateway_requests_total{rpc="ModelInfer",model="m",status="OK"} 2
+        """
+        w0 = """
+        # HELP worker_dispatch_total Total dispatches per model.
+        # TYPE worker_dispatch_total counter
+        worker_dispatch_total{worker="worker0",gpu="0",model="m"} 3
+        # TYPE worker_request_latency_seconds histogram
+        worker_request_latency_seconds_bucket{worker="worker0",model="m",le="+Inf"} 1
+        worker_request_latency_seconds_count{worker="worker0",model="m"} 1
+        """
+        w1 = """
+        # HELP worker_dispatch_total Total dispatches per model.
+        # TYPE worker_dispatch_total counter
+        worker_dispatch_total{worker="worker1",gpu="1",model="m"} 5
+        """
+        merged = ReactantServerGateway.merge_expositions([gw, w0, w1])
+        # One header per family, both workers' samples grouped under it.
+        @test count("# TYPE worker_dispatch_total counter", merged) == 1
+        @test occursin("worker_dispatch_total{worker=\"worker0\",gpu=\"0\",model=\"m\"} 3", merged)
+        @test occursin("worker_dispatch_total{worker=\"worker1\",gpu=\"1\",model=\"m\"} 5", merged)
+        @test occursin("gateway_requests_total{rpc=\"ModelInfer\",model=\"m\",status=\"OK\"} 2", merged)
+        # Histogram suffix lines stay under their family header.
+        i_type = findfirst("# TYPE worker_request_latency_seconds histogram", merged)
+        i_count = findfirst("worker_request_latency_seconds_count", merged)
+        @test i_type !== nothing && i_count !== nothing && first(i_type) < first(i_count)
+        # The worker0 block's samples come before any re-declaration would; exposition parses
+        # as one block per family (no duplicate headers anywhere).
+        @test count("# HELP worker_dispatch_total", merged) == 1
+    end
+
+    @testset "aggregated /metrics endpoint" begin
+        # Two fake workers serving pre-tagged expositions, one dead endpoint.
+        function fake(text)
+            p = grpc_free_port()
+            s = HTTP.serve!("127.0.0.1", p) do req
+                HTTP.Response(200; body = text)
+            end
+            return s, "127.0.0.1:$p"
+        end
+        s0, ep0 = fake("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1\n")
+        s1, ep1 = fake("worker_models_loaded{worker=\"worker1\",gpu=\"1\"} 1\n")
+        dead = "127.0.0.1:$(grpc_free_port())"
+        admin_port = grpc_free_port()
+        metrics = ReactantServerGateway.GatewayMetrics()
+        admin = ReactantServerGateway.start_admin(metrics, "127.0.0.1:$admin_port";
+            worker_metrics = [ep0, ep1, dead])
+        try
+            body = String(HTTP.get("http://127.0.0.1:$admin_port/metrics"; retry = false).body)
+            @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"0\"} 1", body)
+            @test occursin("worker_models_loaded{worker=\"worker1\",gpu=\"1\"} 1", body)
+            @test count("# TYPE gateway_worker_metrics_up gauge", body) == 1
+            @test occursin("gateway_worker_metrics_up{endpoint=\"$ep0\"} 1", body)
+            @test occursin("gateway_worker_metrics_up{endpoint=\"$dead\"} 0", body)
+        finally
+            close(admin.server)
+            close(s0)
+            close(s1)
+        end
+    end
+
+    @testset "metrics endpoints config" begin
+        withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+                "REACTANT_GATEWAY_WORKER_METRICS" => "127.0.0.1:9100, 127.0.0.1:9101") do
+            cfg = ReactantServerGateway.load_gateway(nothing)
+            @test cfg.worker_metrics == ["127.0.0.1:9100", "127.0.0.1:9101"]
+        end
+        withenv("REACTANT_GATEWAY_WORKERS" => "127.0.0.1:8080",
+                "REACTANT_GATEWAY_WORKER_METRICS" => nothing) do
+            @test ReactantServerGateway.load_gateway(nothing).worker_metrics == String[]
+        end
+    end
+end

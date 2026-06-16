@@ -1,28 +1,30 @@
-# Single-GPU end-to-end soak stack: one worker on GPU 2, the gateway, and a dummy-data load
-# generator, all under `docker compose`. Use this to exercise the full serving path on one GPU and
-# watch for memory leaks, races, and instability.
+# Single-GPU end-to-end soak stack: the supervised node on one GPU plus a dummy-data load
+# generator, under `docker compose`. Use this to exercise the full serving path on one GPU and
+# watch for memory leaks, races, and instability. It runs the same all-in-one container as a
+# production single-node deployment (the supervisor with one worker and the embedded gateway),
+# so the soak mirrors what users actually run.
 #
 # Prerequisites:
-#   - docker/node.gpu2.yaml exists (run docker/gen_node_gpu2.sh first; `make gpu2-up` does this)
-#   - images built: `make worker gateway loadgen`
+#   - images built: `make image loadgen`
 #   - the NVIDIA container runtime is available to Docker (sudo nvidia-ctk runtime configure
 #     --runtime=docker && sudo systemctl restart docker)
 #   - git submodules checked out (lib/Reactant.jl, gRPC*, HTTP, Prometheus)
 #
 # Usage:
-#   make gpu2-up                 # generate node file + docker compose up
-#   docker compose -f docker-compose.gpu2.yml up
+#   REACTANTSERVER_MODELS=/path/to/bundles docker compose -f docker-compose.gpu2.yml up
 #
 # The worker compiles and warms up every model's executables before it serves, so first startup is
-# slow (potentially hours for all 85 bundles). The worker healthcheck start_period is set high to
-# cover this; for a quick check, restrict the set with LOADGEN_MODELS and trim the bundle mount.
+# slow (potentially hours for all 85 bundles). The healthcheck start_period is set high to cover
+# this; for a quick check, restrict the set with LOADGEN_MODELS and trim the bundle mount.
 
 services:
-  worker0:
+  reactantserver:
     build:
       context: .
       dockerfile: docker/Dockerfile.worker
-    image: reactantserver-worker:latest
+    image: reactantserver:latest
+    # Default entrypoint: the node supervisor (all-in-one role) runs the single worker plus the
+    # embedded gateway, exactly as a production single-GPU deployment does.
     volumes:
       - ./docker/node.gpu2.yaml:/etc/reactantserver/node.yaml:ro
       - ${REACTANTSERVER_MODELS:-/docker/xlaserver/models}:/var/lib/reactantserver/models:ro
@@ -34,17 +36,23 @@ services:
     # (replacing the small default), so no explicit /dev/shm bind is needed.
     ipc: host
     ports:
-      - "9100:9100"   # Prometheus worker metrics / health (metrics_base_port in node.gpu2.yaml)
+      - "8001:8001"   # KServe V2 gRPC endpoint (Triton-compatible)
+      - "8002:8002"   # gateway metrics / health / admin HTTP; /metrics aggregates the worker's
+                      # own series (tagged worker/gpu), so the worker's 9100 needs no mapping
     environment:
-      REACTANT_WORKER_NAME: worker0
-      # Physical GPU 2; CUDA renumbers it to ordinal 0 inside the container (the worker default).
+      # Physical GPU 2; the supervisor passes it to the worker child, which CUDA renumbers to
+      # ordinal 0 inside the container.
       CUDA_VISIBLE_DEVICES: "2"
+    # The supervisor forwards SIGTERM to its children and waits for them before exiting.
+    stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "julia", "--project=/opt/reactantserver", "/usr/local/bin/healthcheck.worker.jl"]
+      # Role-aware probe; for the all-in-one role it curls the gateway's /readyz (ready once the
+      # worker reports ServerReady).
+      test: ["CMD", "/usr/local/bin/healthcheck.node.sh"]
       interval: 30s
       timeout: 20s
       retries: 5
-      # Generous: all compiled executables compile and warm up before the gRPC plane accepts traffic.
+      # Generous: every model compiles and warms up before the gRPC plane accepts traffic.
       start_period: 14400s
     deploy:
       resources:
@@ -54,33 +62,13 @@ services:
               capabilities: [gpu]
               count: all
 
-  gateway:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile.gateway
-    image: reactantserver-gateway:latest
-    depends_on:
-      worker0:
-        condition: service_healthy
-    volumes:
-      - ./docker/gateway.gpu2.yml:/etc/reactantserver/gateway.yml:ro
-    ports:
-      - "8001:8001"   # KServe V2 gRPC endpoint (Triton-compatible)
-      - "8002:8002"   # Prometheus metrics / health / admin HTTP (Triton-compatible)
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/readyz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-
   loadgen:
     build:
       context: .
       dockerfile: docker/Dockerfile.loadgen
     image: reactantserver-loadgen:latest
     depends_on:
-      gateway:
+      reactantserver:
         condition: service_healthy
     volumes:
       # Read the manifests to synthesize correctly shaped dummy inputs (manifest_io_spec).
@@ -89,8 +77,8 @@ services:
     # the worker without an explicit /dev/shm bind.
     ipc: host
     environment:
-      LOADGEN_GATEWAY: "grpc://gateway:8001"
-      LOADGEN_METRICS: "http://gateway:8002/metrics"
+      LOADGEN_GATEWAY: "grpc://reactantserver:8001"
+      LOADGEN_METRICS: "http://reactantserver:8002/metrics"
       LOADGEN_MODEL_REPO: "/var/lib/reactantserver/models"
       LOADGEN_CONCURRENCY: "32"
       LOADGEN_DURATION_SECONDS: "3600"

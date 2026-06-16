@@ -17,6 +17,7 @@ struct GatewayMetrics
     worker_ready::Prometheus.Family{Prometheus.Gauge}
     placement_weight::Prometheus.Family{Prometheus.Gauge}
     model_utilization::Prometheus.Family{Prometheus.Gauge}
+    worker_metrics_up::Prometheus.Family{Prometheus.Gauge}
 end
 
 function GatewayMetrics()
@@ -46,8 +47,13 @@ function GatewayMetrics()
         "gateway_model_utilization",
         "Estimated per-model expected utilization (arrival rate x compute cost, GPU-seconds/second).",
         (:model,); registry = reg)
+    worker_metrics_up = Prometheus.Family{Prometheus.Gauge}(
+        "gateway_worker_metrics_up",
+        "1 if the worker's metrics endpoint answered the most recent aggregated scrape, else 0.",
+        (:endpoint,); registry = reg)
     return GatewayMetrics(reg, requests_total, request_latency, worker_latency,
-        routing_table_size, worker_ready, placement_weight, model_utilization)
+        routing_table_size, worker_ready, placement_weight, model_utilization,
+        worker_metrics_up)
 end
 
 inc_requests!(m::GatewayMetrics, rpc, model, status) =
@@ -77,10 +83,89 @@ Write all collectors to `io` in the Prometheus text exposition format.
 """
 expose(io::IO, m::GatewayMetrics) = Prometheus.expose(io, m.registry)
 
+# --- Worker metrics aggregation -----------------------------------------------------------------
+
+"""
+    merge_expositions(texts) -> String
+
+Merge several Prometheus text expositions into one valid exposition: each metric family keeps a
+single `# HELP` / `# TYPE` header (the first seen) and the sample lines from every source are
+grouped under it. The sources are the gateway's own export plus each worker's; workers tag all
+their series with `worker`/`gpu` labels, so samples never collide.
+"""
+function merge_expositions(texts::Vector{String})
+    order = String[]                                  # family emission order
+    help = Dict{String,String}()                      # family -> "# HELP ..." line
+    type = Dict{String,String}()                      # family -> "# TYPE ..." line
+    samples = Dict{String,Vector{String}}()           # family -> sample lines
+    current = ""
+    family_of(line) = begin
+        # Sample lines belong to the family of the preceding header when their name extends it
+        # (histogram _bucket/_sum/_count); otherwise the bare metric name is its own family.
+        stop = something(findfirst(c -> c == '{' || c == ' ', line), lastindex(line) + 1)
+        name = line[1:(stop - 1)]
+        (!isempty(current) && (name == current || startswith(name, current * "_"))) ? current : name
+    end
+    ensure!(fam) = fam in order || push!(order, fam)
+    for text in texts
+        current = ""
+        for line in eachline(IOBuffer(text))
+            isempty(strip(line)) && continue
+            if startswith(line, "# HELP ")
+                current = split(line; limit=4)[3]
+                ensure!(current)
+                get!(help, current, line)
+            elseif startswith(line, "# TYPE ")
+                current = split(line; limit=4)[3]
+                ensure!(current)
+                get!(type, current, line)
+            elseif startswith(line, '#')
+                continue
+            else
+                fam = family_of(line)
+                ensure!(fam)
+                push!(get!(samples, fam, String[]), line)
+            end
+        end
+    end
+    io = IOBuffer()
+    for fam in order
+        haskey(help, fam) && println(io, help[fam])
+        haskey(type, fam) && println(io, type[fam])
+        for s in get(samples, fam, String[])
+            println(io, s)
+        end
+    end
+    return String(take!(io))
+end
+
+# Fetch every worker's /metrics concurrently (best effort, bounded by readtimeout) and record
+# per-endpoint reachability in gateway_worker_metrics_up.
+function _fetch_worker_metrics(m::GatewayMetrics, endpoints::Vector{String}; readtimeout::Int=5)
+    bodies = Vector{Union{Nothing,String}}(nothing, length(endpoints))
+    @sync for (i, ep) in enumerate(endpoints)
+        @async begin
+            ok = false
+            try
+                resp = HTTP.get("http://$ep/metrics"; retry = false, status_exception = true,
+                                connect_timeout = readtimeout, request_timeout = readtimeout)
+                bodies[i] = String(resp.body)
+                ok = true
+            catch e
+                @debug "worker metrics scrape failed" endpoint = ep exception = e
+            end
+            Prometheus.set(Prometheus.labels(m.worker_metrics_up, (ep,)), ok ? 1.0 : 0.0)
+        end
+    end
+    return String[b for b in bodies if b !== nothing]
+end
+
 # --- Admin HTTP server ------------------------------------------------------------------------
 
 # Exposes /metrics, /healthz, and /readyz on a separate HTTP/1.1 listener. /readyz reports 200
-# once at least one worker has reported ServerReady.
+# once at least one worker has reported ServerReady. With `worker_metrics` endpoints configured,
+# /metrics aggregates every worker's export behind the gateway's own, so one scrape covers the
+# whole node (workers self-tag their series with worker/gpu labels).
 mutable struct AdminServer
     ready::Threads.Atomic{Bool}
     metrics::GatewayMetrics
@@ -89,16 +174,25 @@ end
 
 set_ready!(a::AdminServer, v::Bool) = (a.ready[] = v; nothing)
 
-function start_admin(metrics::GatewayMetrics, addr::AbstractString)
+function start_admin(metrics::GatewayMetrics, addr::AbstractString;
+                     worker_metrics::Vector{String}=String[])
     host, port = _split_hostport(addr)
     ready = Threads.Atomic{Bool}(false)
     handler = function (req)
         target = req.target
         if target == "/metrics" || startswith(target, "/metrics?")
-            io = IOBuffer()
-            expose(io, metrics)
+            body = if isempty(worker_metrics)
+                io = IOBuffer()
+                expose(io, metrics)
+                String(take!(io))
+            else
+                workers = _fetch_worker_metrics(metrics, worker_metrics)
+                io = IOBuffer()
+                expose(io, metrics)   # after the fetch, so worker_metrics_up is current
+                merge_expositions(pushfirst!(workers, String(take!(io))))
+            end
             return HTTP.Response(200, ["Content-Type" => Prometheus.CONTENT_TYPE_LATEST];
-                                 body = String(take!(io)))
+                                 body = body)
         elseif target == "/healthz"
             return HTTP.Response(200; body = "ok")
         elseif target == "/readyz"

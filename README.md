@@ -14,7 +14,7 @@ non-goals, [docs/src/design/philosophy.md](docs/src/design/philosophy.md).
 
 ## Repository layout
 
-A Julia 1.11 workspace of four packages under `packages/`, plus the non-member
+A Julia 1.11 workspace of five packages under `packages/`, plus the non-member
 `ReactantServerExport`:
 
 - **`ReactantServerCore`** — the shared, Reactant-free substrate: dtypes, the KServe V2 protobuf
@@ -27,6 +27,9 @@ A Julia 1.11 workspace of four packages under `packages/`, plus the non-member
   `probe_worker_ready`). No Reactant.
 - **`ReactantServerClient`** — a Reactant-free inference client (`KServeModel`,
   `infer_sync`, `infer_async`, `InferInput`, `InferOutput`).
+- **`ReactantServerNode`** — the single-container node supervisor (`supervise`): detects the
+  visible GPUs, runs one worker subprocess per device plus the embedded gateway, multiplexes
+  their logs with `[name]` line prefixes, and restarts children that die. No Reactant.
 
 Offline model-export tooling is `packages/ReactantServerExport` (the bundle writer plus the
 Reactant tracing frontend; PyTorch support is a package extension that loads when `PythonCall`
@@ -107,26 +110,39 @@ with server-side `stablehlo-refine` specialization (so a single MLIR module cove
 sizes); the compiled-executable disk cache; CUDA (device) shared memory; multi-model
 orchestrators; and full StableHLO-signature validation of manifests.
 
-## Deployment: standalone worker vs. gateway
+## Deployment: one container, any number of GPUs
 
-Each worker is a single Julia process that drives one GPU and serves the complete KServe V2
-gRPC surface on its own. For a single-GPU deployment this is all you need: point your KServe V2
-gRPC client straight at the worker's host and port.
+The recommended deployment is the unified `reactantserver` image, whose entrypoint is the node
+supervisor (`ReactantServerNode`). It detects every GPU granted to the container, spawns one
+single-GPU worker subprocess per device, runs the embedded gateway, multiplexes all logs onto
+the container's stdout with `[worker0]` / `[gateway]` line prefixes, and restarts children that
+die. A multi-GPU deployment is therefore a single container with no per-GPU configuration:
 
-The gateway reverse proxy is only required in **multi-GPU configurations**. Because a worker
-hosts one GPU and executes one model at a time, scaling across several GPUs means running one
-worker per GPU and spreading models across them. The gateway gives clients a single gRPC
-endpoint and routes each `ModelInferRequest` to a worker serving the requested model,
-forwarding the protobuf bytes unchanged. Replica scheduling is set by `scheduling.mode`:
-`round_robin` (the default) spreads requests uniformly, while `lpt_packing` derives an adaptive
-memory-aware placement from live measurements, concentrating each model's traffic so worker-side
-batch coalescing fills (it requires workers running the `fifo` scheduler discipline). The
-gateway is configured by its own `gateway.yml` (a flat list of worker endpoints across one or
-more nodes) and autodiscovers which models each endpoint serves via `RepositoryIndex`,
-refreshing its routing table periodically. With a single worker the gateway adds a network hop
-and no benefit, so skip it. The gateway is pure Julia, in
-its own `ReactantServerGateway` package (`ReactantServerGateway.serve_gateway`); see
-`docs/src/manual/multi_gpu_gateway.md`.
+```
+docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
+  -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
+```
+
+Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. See `docker/README.md`
+for configuration, multi-node roles (`REACTANT_ROLE=all|workers|gateway`), and metrics.
+
+Underneath, each worker is a single Julia process that drives one GPU and serves the complete
+KServe V2 gRPC surface on its own. For a single-GPU bare-metal deployment that is all you need:
+point your KServe V2 gRPC client straight at the worker's host and port.
+
+The gateway reverse proxy exists for **multi-GPU configurations**. Because a worker hosts one
+GPU and executes one model at a time, scaling across several GPUs means running one worker per
+GPU and spreading models across them. The gateway gives clients a single gRPC endpoint and
+routes each `ModelInferRequest` to a worker serving the requested model, forwarding the protobuf
+bytes unchanged. Replica scheduling is set by `scheduling.mode`: `round_robin` (the default)
+spreads requests uniformly, while `lpt_packing` derives an adaptive memory-aware placement from
+live measurements, concentrating each model's traffic so worker-side batch coalescing fills (it
+requires workers running the `fifo` scheduler discipline). A standalone gateway is configured by
+its own `gateway.yml` (a flat list of worker endpoints across one or more nodes) and
+autodiscovers which models each endpoint serves via `RepositoryIndex`, refreshing its routing
+table periodically; the supervisor's embedded gateway is configured automatically from the node
+file. The gateway is pure Julia, in its own `ReactantServerGateway` package
+(`ReactantServerGateway.serve_gateway`); see `docs/src/manual/multi_gpu_gateway.md`.
 
 ## Shape convention (Julia-centric, zero-copy interop)
 
@@ -206,13 +222,21 @@ run it in the background and receive a handle that `stop!` shuts down. Pass
 `backend=ReactantServer.ReactantBackend()` (the default) for real execution. Any KServe V2 gRPC
 client can then call the server directly at the configured host and port.
 
-For a multi-GPU deployment, run one worker per GPU (each pointed at the same node file with a
-distinct `worker`) behind the `reactant-gateway` reverse proxy, which routes by model name and
-load-balances replicated models. The gateway is pure Julia:
-`using ReactantServerGateway; ReactantServerGateway.serve_gateway(gateway_path)` reads its own
-`gateway.yml` and serves the KServe V2 gRPC proxy. To call a server from Julia, use the
+For a multi-GPU deployment, the supervisor does the fan-out for you:
+
+```julia
+using ReactantServerNode
+ReactantServerNode.supervise("docker/node.yaml")   # one worker per visible GPU + gateway
+```
+
+It synthesizes the worker list when the node file has none (`gpus: auto`), spawns each worker as
+a subprocess pinned to its device via `CUDA_VISIBLE_DEVICES`, and runs the embedded gateway,
+which routes by model name and load-balances replicated models. Equivalently, run one worker per
+GPU yourself (each pointed at the same node file with a distinct `worker`) behind a standalone
+gateway: `using ReactantServerGateway; ReactantServerGateway.serve_gateway(gateway_path)` reads
+its own `gateway.yml` and serves the KServe V2 gRPC proxy. To call a server from Julia, use the
 Reactant-free `ReactantServerClient` package (`KServeModel` + `infer_sync`). See `docker/`
-for a ready `docker compose` setup.
+for the container setup.
 
 A bundle is a directory containing `manifest.yaml`, `model.mlir` (a serialized StableHLO
 portable artifact), `weights.safetensors`, and an optional `model.jl`. Bundles are produced by
@@ -245,6 +269,7 @@ julia --project=packages/ReactantServerCore   -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServer        -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServerClient  -e 'using Pkg; Pkg.test()'
+julia --project=packages/ReactantServerNode    -e 'using Pkg; Pkg.test()'
 ```
 
 `packages/ReactantServer/test/spike_reactant.jl` is a standalone script that exercises the

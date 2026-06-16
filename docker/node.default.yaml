@@ -1,0 +1,27 @@
+# Default node config baked into the reactantserver image at /etc/reactantserver/node.yaml.
+# With it, `docker run --gpus all` needs no configuration at all: the supervisor detects the
+# visible GPUs and spawns one worker per device (worker0..workerN-1, ports base_port+i), plus
+# the embedded gateway on 8001 (gRPC) / 8002 (metrics, health). Mount your own file over
+# /etc/reactantserver/node.yaml to override anything here; see docker/node.yaml for the fully
+# commented multi-worker template (explicit workers lists, per-model device pinning, roles).
+
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+metrics_base_port: 9100
+
+# One worker per visible GPU. Also accepts an integer count or an explicit device list
+# (ordinals or GPU UUIDs); the REACTANT_GPUS environment variable overrides this key.
+gpus: auto
+
+global:
+  cache_dir: /var/cache/reactantserver
+  runtime:
+    backend: cuda
+    mem_fraction: 0.9
+    preallocate: true
+    allow_cpu_fallback: false
+  scheduler:
+    ema_halflife_seconds: 30.0
+    max_queue_depth: 1024
+  endpoints:
+    host: 0.0.0.0

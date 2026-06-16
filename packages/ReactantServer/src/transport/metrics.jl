@@ -108,8 +108,9 @@ function Prometheus.collect!(metrics::Vector, c::WorkerSnapshotCollector)
         )
     end
 
-    # Identity + config, for grouping. The physical-GPU label is applied in the Prometheus scrape
-    # config (the worker cannot know its physical GPU under per-container CUDA_VISIBLE_DEVICES).
+    # Identity + config, for grouping. Every exported series additionally carries worker/gpu
+    # labels injected at exposition time (see start_worker_metrics), so an aggregated scrape
+    # through the gateway stays per-worker attributable without scrape-config relabeling.
     info_ln = Prometheus.LabelNames(("worker", "device_ordinal", "control_mode", "discipline", "residency_mode"))
     info_lv = Prometheus.LabelValues((
         c.worker_name,
@@ -161,20 +162,78 @@ observe_request!(m::WorkerMetrics, model, secs) =
 
 # --- HTTP exposition --------------------------------------------------------------------------
 
+_escape_label_value(v::AbstractString) =
+    replace(String(v), "\\" => "\\\\", "\"" => "\\\"", "\n" => "\\n")
+
 """
-    start_worker_metrics(metrics, host, port; ready_fn) -> HTTP server
+    inject_metric_labels(text, labels) -> String
+
+Rewrite a Prometheus text exposition so every sample line carries the given constant labels
+(e.g. `worker="worker0"`, `gpu="1"`). Comment lines (`# HELP` / `# TYPE`) pass through; a label
+key already present on a line is left alone (e.g. `worker_info`'s own `worker`). This is how a
+worker tags its entire export (including `process_*`/`julia_gc_*`) with its identity, so series
+stay attributable when the gateway aggregates many workers into one scrape.
+"""
+function inject_metric_labels(text::AbstractString, labels::Vector{Pair{String,String}})
+    isempty(labels) && return String(text)
+    out = IOBuffer()
+    for line in eachline(IOBuffer(text); keep=true)
+        stripped = rstrip(line)
+        if isempty(stripped) || startswith(stripped, '#')
+            write(out, line)
+            continue
+        end
+        brace = findfirst('{', stripped)
+        sep = findfirst(' ', stripped)
+        if brace !== nothing && (sep === nothing || brace < sep)
+            existing = stripped[brace:end]
+            add = join(("$k=\"$(_escape_label_value(v))\"" for (k, v) in labels
+                        if !occursin("$k=\"", existing)), ",")
+            write(out, isempty(add) ? line :
+                  stripped[1:brace] * add * "," * stripped[(brace + 1):end] * "\n")
+        elseif sep !== nothing
+            add = join(("$k=\"$(_escape_label_value(v))\"" for (k, v) in labels), ",")
+            write(out, stripped[1:(sep - 1)] * "{" * add * "}" * stripped[sep:end] * "\n")
+        else
+            write(out, line)
+        end
+    end
+    return String(take!(out))
+end
+
+# The worker's physical-GPU identity for the metrics `gpu` label. Under the supervisor (and the
+# per-GPU-container layout) CUDA_VISIBLE_DEVICES holds exactly the physical selector; on bare
+# metal with several visible devices, pick the token the worker actually addresses.
+function _gpu_identity(cfg::ServerConfig, env::AbstractDict=ENV)
+    cfg.runtime.backend == CUDA_BACKEND || return ""
+    cvd = get(env, "CUDA_VISIBLE_DEVICES", "")
+    toks = [strip(t) for t in split(cvd, ',') if !isempty(strip(t))]
+    length(toks) == 1 && return String(toks[1])
+    n = cfg.runtime.device_ordinal
+    length(toks) > 1 && n + 1 <= length(toks) && return String(toks[n + 1])
+    return isempty(toks) ? string(n) : ""
+end
+
+"""
+    start_worker_metrics(metrics, host, port; ready_fn, worker_name="", gpu="") -> HTTP server
 
 Serve `/metrics` (Prometheus text exposition), `/healthz`, and `/readyz` (`ready_fn()`) on an
-HTTP/1.1 listener. Mirrors the gateway's admin server. Close the returned server to stop it.
+HTTP/1.1 listener. Mirrors the gateway's admin server. Non-empty `worker_name` / `gpu` are
+injected as constant `worker` / `gpu` labels on every exported series. Close the returned
+server to stop it.
 """
-function start_worker_metrics(m::WorkerMetrics, host::AbstractString, port::Integer; ready_fn)
+function start_worker_metrics(m::WorkerMetrics, host::AbstractString, port::Integer; ready_fn,
+                              worker_name::AbstractString="", gpu::AbstractString="")
+    labels = Pair{String,String}[]
+    isempty(worker_name) || push!(labels, "worker" => String(worker_name))
+    isempty(gpu) || push!(labels, "gpu" => String(gpu))
     handler = function (req)
         target = req.target
         if target == "/metrics" || startswith(target, "/metrics?")
             io = IOBuffer()
             Prometheus.expose(io, m.registry)
             return HTTP.Response(200, ["Content-Type" => Prometheus.CONTENT_TYPE_LATEST];
-                                 body = String(take!(io)))
+                                 body = inject_metric_labels(String(take!(io)), labels))
         elseif target == "/healthz"
             return HTTP.Response(200; body = "ok")
         elseif target == "/readyz"

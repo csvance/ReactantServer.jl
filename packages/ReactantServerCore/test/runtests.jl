@@ -10,6 +10,7 @@ const ReactantServer = ReactantServerCore
     include("test_dtypes.jl")
     include("test_manifest.jl")
     include("test_config.jl")
+    include("test_node_materialize.jl")
     include("test_codec.jl")
     include("test_buffer_pool.jl")
     include("test_weight_store.jl")

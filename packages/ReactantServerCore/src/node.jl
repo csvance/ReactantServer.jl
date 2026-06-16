@@ -146,17 +146,112 @@ function validate_node(node::AbstractDict)
 end
 
 """
+    load_node_raw(path) -> Dict{String,Any}
+
+Read a node config file without structural validation. Used by the supervisor, which may need
+to synthesize the `workers:` list (see [`materialize_node!`](@ref)) before validating.
+"""
+function load_node_raw(path::AbstractString)
+    isfile(path) || throw(ConfigError("node config file not found: $path"))
+    raw = YAML.load_file(path; dicttype=Dict{String,Any})
+    raw isa AbstractDict || throw(ConfigError("node config root must be a mapping"))
+    return Dict{String,Any}(raw)
+end
+
+"""
     load_node(path) -> Dict{String,Any}
 
 Read and structurally validate a node config file.
 """
 function load_node(path::AbstractString)
-    isfile(path) || throw(ConfigError("node config file not found: $path"))
-    raw = YAML.load_file(path; dicttype=Dict{String,Any})
-    raw isa AbstractDict || throw(ConfigError("node config root must be a mapping"))
-    node = Dict{String,Any}(raw)
+    node = load_node_raw(path)
     validate_node(node)
     return node
+end
+
+"""
+    node_gpus(node) -> :auto | Int | Vector{String}
+
+Parse the optional top-level `gpus:` key: `auto` (the default when absent) asks the supervisor
+to enumerate visible devices; an integer is a device count (expanded to ordinals `0..n-1`); a
+list gives explicit device selectors (ordinals or GPU UUIDs, passed to `CUDA_VISIBLE_DEVICES`
+verbatim).
+"""
+function node_gpus(node::AbstractDict)
+    haskey(node, "gpus") || return :auto
+    g = node["gpus"]
+    g isa AbstractString && lowercase(strip(g)) == "auto" && return :auto
+    if g isa Integer
+        Int(g) >= 0 || throw(ConfigError("node config 'gpus' count must be >= 0"))
+        return Int(g)
+    end
+    if g isa AbstractVector
+        out = String[]
+        for d in g
+            d isa Integer ? push!(out, string(Int(d))) :
+            d isa AbstractString ? push!(out, String(strip(d))) :
+            throw(ConfigError("node config 'gpus' entries must be device ordinals or UUID strings"))
+        end
+        isempty(out) && throw(ConfigError("node config 'gpus' list must not be empty"))
+        return out
+    end
+    throw(ConfigError("node config 'gpus' must be 'auto', an integer count, or a list of devices"))
+end
+
+"""
+    materialize_node!(node, devices; cpu_workers=1) -> Vector{Union{String,Nothing}}
+
+Prepare a raw node config for supervised single-container deployment: assign one visible device
+per worker and return the per-worker device selectors (in worker declaration order; `nothing`
+means the worker gets no `CUDA_VISIBLE_DEVICES` of its own, the CPU case).
+
+With no `workers:` list, one is synthesized: `worker0..workerN-1`, one per device (or
+`cpu_workers` workers when `devices` is empty). An explicit `workers:` list wins: each worker is
+assigned `devices[i]` positionally, or `devices[gpu+1]` when the entry carries a `gpu:` key. The
+`gpu:` key is consumed here (deleted after assignment) so each child process, seeing a single
+device through `CUDA_VISIBLE_DEVICES`, resolves device ordinal 0. Assigning one device to two
+workers, or having more workers than devices, is a `ConfigError`. Call `validate_node` on the
+result before use.
+"""
+function materialize_node!(node::AbstractDict, devices::AbstractVector{<:AbstractString};
+                           cpu_workers::Int=1)
+    devs = String[String(d) for d in devices]
+    if !haskey(node, "workers")
+        n = isempty(devs) ? cpu_workers : length(devs)
+        n >= 1 || throw(ConfigError("cannot materialize a node with no devices and cpu_workers < 1"))
+        node["workers"] = Any[Dict{String,Any}("name" => "worker$(i)") for i in 0:(n - 1)]
+        return isempty(devs) ? Union{String,Nothing}[nothing for _ in 1:n] :
+               Union{String,Nothing}[d for d in devs]
+    end
+
+    workers = _node_workers(node)
+    selectors = Union{String,Nothing}[]
+    assigned = Dict{String,String}()   # device selector -> worker name
+    for (i, w) in enumerate(workers)
+        name = _worker_name(w)
+        if isempty(devs)
+            push!(selectors, nothing)
+            continue
+        end
+        idx = if haskey(w, "gpu")
+            g = w["gpu"]
+            g isa Integer || throw(ConfigError("node worker '$name' gpu must be an integer"))
+            Int(g) + 1
+        else
+            i
+        end
+        idx <= length(devs) ||
+            throw(ConfigError("node worker '$name' needs device $(idx - 1) but only $(length(devs)) device(s) are visible"))
+        dev = devs[idx]
+        haskey(assigned, dev) &&
+            throw(ConfigError("node workers '$(assigned[dev])' and '$name' are both assigned device '$dev'; set distinct 'gpu' keys"))
+        assigned[dev] = name
+        # The child sees exactly this device via CUDA_VISIBLE_DEVICES, renumbered to ordinal 0;
+        # a surviving `gpu:` key would make worker_raw_config address a nonexistent ordinal.
+        delete!(w, "gpu")
+        push!(selectors, dev)
+    end
+    return selectors
 end
 
 """

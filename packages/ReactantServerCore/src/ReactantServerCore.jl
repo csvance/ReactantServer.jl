@@ -102,7 +102,8 @@ export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, Server
 export build_config, validate_config, apply_env_overrides!, log_effective_config
 
 # ---- node ----
-export load_node, validate_node, worker_names, worker_raw_config, node_server_config
+export load_node, load_node_raw, validate_node, worker_names, worker_raw_config, node_server_config
+export node_gpus, materialize_node!
 
 # ---- shared-memory registry ----
 export ShmRegion, SharedMemoryRegistry, shm_register!, shm_unregister!, shm_read, shm_write!

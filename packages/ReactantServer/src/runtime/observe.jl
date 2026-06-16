@@ -91,5 +91,7 @@ end
 log_model_unloaded(name::AbstractString, nbytes::Integer; memory::AbstractString) =
     (@info "model unloaded" name = name freed = Base.format_bytes(nbytes) memory = memory; nothing)
 
+# Debug level: residency moves happen on the request path (on-demand weight cache churn), which
+# is far too chatty for the default log surface. Enable with JULIA_DEBUG=ReactantServer.
 log_residency_change(name::AbstractString, from, to, nbytes::Integer; memory::AbstractString) =
-    (@info "residency: model moved" name = name from = from to = to bytes = Base.format_bytes(nbytes) memory = memory; nothing)
+    (@debug "residency: model moved" name = name from = from to = to bytes = Base.format_bytes(nbytes) memory = memory; nothing)

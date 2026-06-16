@@ -136,7 +136,7 @@ function acquire!(cache::WeightCache, entry::ModelEntry)
         for fb in to_free
             free_weights!(cache.backend, fb)
         end
-        @info "residency: evicted for headroom" loading = entry.name evicted = victims
+        @debug "residency: evicted for headroom" loading = entry.name evicted = victims
     end
 
     # Transfer the target's weights to the GPU (outside the lock), then commit residency. With

@@ -1,0 +1,58 @@
+# Multi-node ReactantServer deployment: the gateway on one host, GPU workers on one or more
+# other hosts. Run the `workers` service on every GPU node and the `gateway` service on the
+# gateway host (these are two compose projects in practice, one per host; they are shown
+# together here as a single reference).
+#
+# Worker nodes use the same unified image as the single-container deployment with
+# REACTANT_ROLE=workers: the supervisor spawns one worker per visible GPU but no embedded
+# gateway, and the workers bind 0.0.0.0 so the remote gateway can reach them on
+# base_port+i (8080, 8081, ...) per the node file.
+#
+# The gateway host runs the slim gateway-only image with a static gateway.yml listing every
+# worker endpoint across all nodes, e.g.
+#
+#   endpoints:
+#     - "nodeA:8080"
+#     - "nodeA:8081"
+#     - "nodeB:8080"
+#
+# Note: the KServe system-shared-memory data plane assumes client and worker share a host, so it
+# does not apply across nodes; multi-node clients use the inline tensor path.
+
+services:
+  workers:
+    image: reactantserver:latest
+    environment:
+      REACTANT_ROLE: workers
+    volumes:
+      - ${REACTANTSERVER_MODELS:-./bundles}:/var/lib/reactantserver/models:ro
+      # Optional: mount a node file to change ports or list workers explicitly.
+      # - ./docker/node.yaml:/etc/reactantserver/node.yaml:ro
+    ipc: host
+    # Publish one gRPC port and one metrics port per GPU (base_port / metrics_base_port + i).
+    # Widen the ranges to cover the node's GPU count.
+    ports:
+      - "8080-8087:8080-8087"
+      - "9100-9107:9100-9107"
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              capabilities: [gpu]
+              count: all
+
+  gateway:
+    image: reactantserver-gateway:latest
+    volumes:
+      - ./docker/gateway.yml:/etc/reactantserver/gateway.yml:ro
+    ports:
+      - "8001:8001"   # KServe V2 gRPC endpoint for clients
+      - "8002:8002"   # Prometheus metrics / health / admin HTTP
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8002/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

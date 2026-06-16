@@ -99,7 +99,7 @@ end
 end
 
 @testset "pick_placement: weighted sampling and failover order" begin
-    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], 60, 1, 1, "info", "json",
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 15.0, 0.8, 0.1, 30.0)
     s = GW.LptPackingState(cfg)
     @atomic s.assignment = Dict{String,GW.Placement}("m" => [("w0", 0.9), ("w1", 0.1)])

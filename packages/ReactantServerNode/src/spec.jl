@@ -1,0 +1,133 @@
+# Child process specifications: the exact Cmd (program, args, env) for each worker and for the
+# embedded gateway. Workers run the unchanged `ReactantServer.serve(node_file; worker=name)`
+# entry, exactly like the standalone per-GPU container did; the only supervisor-added environment
+# is the worker identity and its single-device CUDA_VISIBLE_DEVICES. Bind hosts stay the node
+# file's concern (`endpoints.host`); in a container, which ports are reachable is decided by
+# what the operator publishes, and worker metrics ports must remain scrapable.
+
+struct ChildSpec
+    name::String
+    cmd::Cmd
+    grace_seconds::Float64   # SIGTERM-to-SIGKILL window at shutdown
+end
+
+"""
+    default_workspace_root(env=ENV) -> String
+
+The monorepo root containing `packages/`. `REACTANT_WORKSPACE_ROOT` wins; otherwise it is
+derived from the active project, which for the supervisor is
+`<root>/packages/ReactantServerNode/Project.toml`.
+"""
+function default_workspace_root(env::AbstractDict=ENV)
+    haskey(env, "REACTANT_WORKSPACE_ROOT") && return String(env["REACTANT_WORKSPACE_ROOT"])
+    proj = Base.active_project()
+    proj === nothing && throw(ConfigError("no active project; set REACTANT_WORKSPACE_ROOT"))
+    return dirname(dirname(dirname(proj)))
+end
+
+# PR_SET_PDEATHSIG: the kernel SIGTERMs the child if the supervisor dies, however it dies
+# (including SIGKILL, which no userspace forwarding can survive). Linux-only; a no-op guard
+# elsewhere.
+const _PDEATHSIG_BOOT = """
+Sys.islinux() && ccall(:prctl, Cint, (Cint, Culong, Culong, Culong, Culong), 1, 15, 0, 0, 0)
+"""
+
+const _WORKER_BOOT = _PDEATHSIG_BOOT * """
+using ReactantServer
+w = get(ENV, "REACTANT_WORKER_NAME", "")
+ReactantServer.serve(ARGS[1]; worker = isempty(w) ? nothing : w)
+"""
+
+function worker_spec(name::AbstractString, node_file::AbstractString,
+                     device::Union{AbstractString,Nothing}, workspace_root::AbstractString;
+                     grace_seconds::Real=15.0)
+    proj = joinpath(workspace_root, "packages", "ReactantServer")
+    cmd = `$(Base.julia_cmd()) --project=$proj -e $_WORKER_BOOT $node_file`
+    pairs = Pair{String,String}["REACTANT_WORKER_NAME" => String(name)]
+    # Always set device visibility explicitly: the assigned selector, or empty for a CPU worker,
+    # so a container-level CUDA_VISIBLE_DEVICES is never inherited by accident.
+    push!(pairs, "CUDA_VISIBLE_DEVICES" => (device === nothing ? "" : String(device)))
+    return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))
+end
+
+const _GATEWAY_BOOT = _PDEATHSIG_BOOT * """
+using ReactantServerGateway
+ReactantServerGateway.serve_gateway(isempty(ARGS) ? nothing : ARGS[1])
+"""
+
+"""
+    gateway_spec(workspace_root; gateway_path=nothing, endpoints=nothing,
+                 metrics_endpoints=nothing) -> ChildSpec
+
+The embedded gateway child. With no `gateway_path`, the gateway runs from defaults plus
+`REACTANT_GATEWAY_*` environment: `endpoints` (the node's loopback worker addresses) is
+synthesized into `REACTANT_GATEWAY_WORKERS`, and `metrics_endpoints` (the workers' metrics
+addresses) into `REACTANT_GATEWAY_WORKER_METRICS`, so the gateway's /metrics aggregates every
+worker's export. A mounted gateway.yml wins: it is passed through and no endpoint env is set.
+"""
+function gateway_spec(workspace_root::AbstractString;
+                      gateway_path::Union{AbstractString,Nothing}=nothing,
+                      endpoints::Union{Vector{String},Nothing}=nothing,
+                      metrics_endpoints::Union{Vector{String},Nothing}=nothing,
+                      grace_seconds::Real=10.0)
+    proj = joinpath(workspace_root, "packages", "ReactantServerGateway")
+    cmd = gateway_path === nothing ?
+          `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT` :
+          `$(Base.julia_cmd()) --project=$proj -e $_GATEWAY_BOOT $gateway_path`
+    if gateway_path === nothing
+        pairs = Pair{String,String}[]
+        endpoints === nothing || push!(pairs, "REACTANT_GATEWAY_WORKERS" => join(endpoints, ","))
+        metrics_endpoints === nothing || isempty(metrics_endpoints) ||
+            push!(pairs, "REACTANT_GATEWAY_WORKER_METRICS" => join(metrics_endpoints, ","))
+        isempty(pairs) || (cmd = addenv(cmd, pairs...))
+    end
+    return ChildSpec("gateway", cmd, Float64(grace_seconds))
+end
+
+"""
+    worker_endpoints(node; host="127.0.0.1") -> Vector{String}
+
+The node's worker gRPC addresses (`host:port` per worker, ports via the node's base_port math),
+as fed to the embedded gateway.
+"""
+function worker_endpoints(node::AbstractDict; host::AbstractString="127.0.0.1")
+    ws = _node_workers(node)
+    return String["$host:$(_worker_port(node, w, i - 1))" for (i, w) in enumerate(ws)]
+end
+
+"""
+    worker_metrics_endpoints(node; host="127.0.0.1") -> Vector{String}
+
+The node's worker metrics addresses (`metrics_base_port + i` per worker); empty when the node
+has no `metrics_base_port`.
+"""
+function worker_metrics_endpoints(node::AbstractDict; host::AbstractString="127.0.0.1")
+    mbp = get(node, "metrics_base_port", nothing)
+    mbp isa Integer || return String[]
+    return String["$host:$(Int(mbp) + i - 1)" for i in 1:length(_node_workers(node))]
+end
+
+# The gateway's listen ports (for the worker-port collision warning): defaults 8001/8002,
+# overridden by a mounted gateway.yml's listen block, overridden by REACTANT_GATEWAY_LISTEN_*.
+function _gateway_listen_ports(gateway_path::Union{AbstractString,Nothing}, env::AbstractDict)
+    listen = Dict{String,Any}()
+    if gateway_path !== nothing && isfile(gateway_path)
+        raw = try
+            YAML.load_file(gateway_path; dicttype=Dict{String,Any})
+        catch
+            nothing
+        end
+        raw isa AbstractDict && get(raw, "listen", nothing) isa AbstractDict &&
+            (listen = raw["listen"])
+    end
+    g = get(env, "REACTANT_GATEWAY_LISTEN_GRPC", get(listen, "grpc", "0.0.0.0:8001"))
+    m = get(env, "REACTANT_GATEWAY_LISTEN_METRICS", get(listen, "metrics", "0.0.0.0:8002"))
+    ports = Set{Int}()
+    for addr in (g, m)
+        i = findlast(==(':'), String(addr))
+        i === nothing && continue
+        p = tryparse(Int, String(addr)[(i + 1):end])
+        p === nothing || push!(ports, p)
+    end
+    return ports
+end

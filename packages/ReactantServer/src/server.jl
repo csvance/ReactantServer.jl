@@ -148,7 +148,8 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     metrics_server = nothing
     if cfg.endpoints.metrics_port > 0
         ready_fn = () -> (es = values(registry.by_name); !isempty(es) && all(e -> e.executable !== nothing, es))
-        metrics_server = start_worker_metrics(metrics, cfg.endpoints.host, cfg.endpoints.metrics_port; ready_fn=ready_fn)
+        metrics_server = start_worker_metrics(metrics, cfg.endpoints.host, cfg.endpoints.metrics_port;
+            ready_fn=ready_fn, worker_name=worker_name, gpu=_gpu_identity(cfg))
     end
     @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port models = model_names(registry)
     if blocking

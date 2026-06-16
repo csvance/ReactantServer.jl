@@ -9,6 +9,7 @@ struct GatewayConfig
     listen_grpc::String
     listen_metrics::String
     workers::Vector{String}                 # worker URLs (host:port) to discover and forward to
+    worker_metrics::Vector{String}          # worker metrics URLs (host:port) aggregated into /metrics
     request_timeout_seconds::Int
     max_recv_msg_bytes::Int
     max_send_msg_bytes::Int
@@ -56,14 +57,15 @@ function _apply_gateway_env!(raw::AbstractDict)
     return applied
 end
 
-# Parse the `endpoints:` list into a deduplicated, order-preserving vector of host:port strings.
-function _gateway_endpoints(raw::AbstractDict)
-    eps = get(raw, "endpoints", nothing)
+# Parse an endpoint list (`endpoints:` / `metrics_endpoints:`) into a deduplicated,
+# order-preserving vector of host:port strings.
+function _gateway_endpoints(raw::AbstractDict, key::String="endpoints")
+    eps = get(raw, key, nothing)
     eps === nothing && return String[]
-    eps isa AbstractVector || throw(ConfigError("gateway config 'endpoints' must be a list of host:port strings"))
+    eps isa AbstractVector || throw(ConfigError("gateway config '$key' must be a list of host:port strings"))
     out = String[]
     for e in eps
-        e isa AbstractString || throw(ConfigError("gateway config 'endpoints' entries must be host:port strings"))
+        e isa AbstractString || throw(ConfigError("gateway config '$key' entries must be host:port strings"))
         url = String(strip(e))
         isempty(url) && continue
         _split_hostport(url)              # validate shape
@@ -72,20 +74,40 @@ function _gateway_endpoints(raw::AbstractDict)
     return out
 end
 
+# A comma-separated env override for an endpoint list, validated; nothing when unset.
+function _env_endpoints(var::String)
+    haskey(ENV, var) || return nothing
+    out = String[strip(String(x)) for x in split(ENV[var], ',') if !isempty(strip(x))]
+    for u in out
+        _split_hostport(u)
+    end
+    return out
+end
+
 """
     load_gateway(gateway_path) -> GatewayConfig
 
 Load and validate the gateway's `gateway.yml`: its listen addresses, worker-client and gRPC
-limits, logging, and the `endpoints:` worker list. Applies `REACTANT_GATEWAY_*` environment
-overrides; `REACTANT_GATEWAY_WORKERS` (comma separated) replaces the endpoint list. TLS settings
-are parsed but not enforced (cleartext h2c only for now); a configured cert triggers a warning.
+limits, logging, the `endpoints:` worker list, and the optional `metrics_endpoints:` worker
+metrics list (aggregated into the admin `/metrics`). Applies `REACTANT_GATEWAY_*` environment
+overrides; `REACTANT_GATEWAY_WORKERS` / `REACTANT_GATEWAY_WORKER_METRICS` (comma separated)
+replace the respective lists. TLS settings are parsed but not enforced (cleartext h2c only for
+now); a configured cert triggers a warning.
+
+`gateway_path` may be `nothing`: the config starts from defaults and the environment alone,
+which is how the node supervisor launches an embedded gateway (it synthesizes
+`REACTANT_GATEWAY_WORKERS` from the node file, so no gateway.yml is needed).
 """
 function load_gateway(gateway_path::AbstractString)
     isfile(gateway_path) || throw(ConfigError("gateway config file not found: $gateway_path"))
     parsed = YAML.load_file(gateway_path; dicttype=Dict{String,Any})
     parsed isa AbstractDict || throw(ConfigError("gateway config root must be a mapping"))
-    raw = Dict{String,Any}(parsed)
+    return _build_gateway_config(Dict{String,Any}(parsed))
+end
 
+load_gateway(::Nothing) = _build_gateway_config(Dict{String,Any}())
+
+function _build_gateway_config(raw::Dict{String,Any})
     applied = _apply_gateway_env!(raw)
 
     listen = _subdict(raw, "listen")
@@ -97,12 +119,20 @@ function load_gateway(gateway_path::AbstractString)
 
     workers = _gateway_endpoints(raw)
     wenv = GW_ENV_PREFIX * "WORKERS"
-    if haskey(ENV, wenv)
-        workers = String[strip(String(x)) for x in split(ENV[wenv], ',') if !isempty(strip(x))]
-        for u in workers
-            _split_hostport(u)
-        end
+    env_workers = _env_endpoints(wenv)
+    if env_workers !== nothing
+        workers = env_workers
         push!(applied, wenv)
+    end
+
+    # Optional worker metrics endpoints, aggregated into the admin /metrics so one scrape covers
+    # the gateway plus every worker (workers self-tag their series with worker/gpu labels).
+    worker_metrics = _gateway_endpoints(raw, "metrics_endpoints")
+    menv = GW_ENV_PREFIX * "WORKER_METRICS"
+    env_metrics = _env_endpoints(menv)
+    if env_metrics !== nothing
+        worker_metrics = env_metrics
+        push!(applied, menv)
     end
 
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
@@ -113,6 +143,7 @@ function load_gateway(gateway_path::AbstractString)
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
         _opt(listen, "metrics", String, "0.0.0.0:8002"),
         workers,
+        worker_metrics,
         _opt(wc, "request_timeout_seconds", Int, 60),
         _opt(grpc, "max_recv_msg_bytes", Int, 256 * 1024 * 1024),
         _opt(grpc, "max_send_msg_bytes", Int, 256 * 1024 * 1024),

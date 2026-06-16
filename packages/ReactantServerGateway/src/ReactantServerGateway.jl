@@ -70,15 +70,20 @@ struct RunningGateway
 end
 
 """
-    serve_gateway(gateway_path; blocking=true) -> nothing | RunningGateway
+    serve_gateway(gateway_path=nothing; blocking=true) -> nothing | RunningGateway
 
 Load `gateway.yml` (listen addresses and the worker endpoint list), build the worker client pool,
 start the admin HTTP server and the readiness/discovery prober (which probes each endpoint's
 ServerReady and RepositoryIndex and swaps in the discovered routing table), and serve the KServe
 gRPC proxy. When `blocking` is false the server runs in the background and a [`RunningGateway`](@ref)
 is returned (stop it with [`stop!`](@ref)).
+
+`gateway_path` may be omitted (or `nothing`) to configure the gateway from defaults and
+`REACTANT_GATEWAY_*` environment variables alone; the endpoint list then comes from
+`REACTANT_GATEWAY_WORKERS`. The node supervisor uses this to run an embedded gateway without a
+gateway.yml.
 """
-function serve_gateway(gateway_path::AbstractString; blocking::Bool = true)
+function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; blocking::Bool = true)
     cfg = load_gateway(gateway_path)
     pool = ClientPool(cfg)
     routes = DiscoveredRoutes()
@@ -96,7 +101,7 @@ function serve_gateway(gateway_path::AbstractString; blocking::Bool = true)
     end
     state = GatewayState(pool, routes, gate, metrics, refresher, packing)
 
-    admin = start_admin(metrics, cfg.listen_metrics)
+    admin = start_admin(metrics, cfg.listen_metrics; worker_metrics = cfg.worker_metrics)
     # Discover routes once synchronously so the table is populated before we accept traffic;
     # reachable endpoints are routable immediately, and the prober refreshes the rest.
     try

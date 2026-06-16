@@ -9,6 +9,12 @@
 
 x-worker: &worker
   image: reactantserver-worker:latest
+  # Per-GPU-container layout: two separate containers each see one CDI-assigned GPU and run one
+  # named worker (REACTANT_WORKER_NAME) selected from the two-worker node file, fronted by the
+  # standalone gateway. The supervisor cannot drive this (it would try to run both workers in a
+  # one-GPU container), so this stack uses the single-worker entrypoint directly. The supervised
+  # all-in-one image is exercised by the CPU e2e (run_e2e_cpu.sh) and the gpu2 soak instead.
+  entrypoint: ["tini", "--", "/usr/local/bin/entrypoint.worker.sh"]
   volumes:
     - ${REACTANT_REPO:?set REACTANT_REPO to the repo root (run via make e2e / run_e2e.sh)}/packages/ReactantServer/test/e2e/node.yaml:/etc/reactantserver/node.yaml:ro
     - ${REACTANT_REPO}/packages/ReactantServer/test/e2e/models/scale4:/var/lib/reactantserver/models/scale4:ro

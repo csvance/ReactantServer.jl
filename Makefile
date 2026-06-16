@@ -1,31 +1,37 @@
 # Container-based image builds for ReactantServer. Targets shell out to a container engine
-# (podman by default; rootless is fine). The build context for both images is the repository
-# root. The gateway is now pure Julia (no Go toolchain or protoc required).
+# (podman by default; rootless is fine). The build context for the images is the repository
+# root. The gateway is pure Julia (no Go toolchain or protoc required).
 #
-#   make            # build the gateway image (default)
-#   make gateway    # build the reactant-gateway image
-#   make worker     # build the ReactantServer worker image (large: pulls Reactant/CUDA artifacts)
+#   make            # build the unified node image (default)
+#   make image      # build the unified reactantserver node image (supervisor: workers + gateway)
+#   make gateway    # build the slim gateway-only image (for multi-node gateway hosts)
+#   make worker     # alias for `make image` (kept for the per-GPU-container layout)
 #   make e2e        # full-stack end-to-end test (2 GPU workers + gateway; TCP and SHM)
 #   make clean      # remove the images this Makefile builds
 
 SHELL := /bin/bash
 
 ENGINE        ?= podman
+NODE_IMAGE    ?= reactantserver:latest
 GATEWAY_IMAGE ?= reactantserver-gateway:latest
 WORKER_IMAGE  ?= reactantserver-worker:latest
 LOADGEN_IMAGE ?= reactantserver-loadgen:latest
 
-.PHONY: all gateway worker loadgen e2e clean help
+.PHONY: all image gateway worker loadgen e2e clean help
 
-all: gateway
+all: image
 
-## gateway: build the pure-Julia reactant-gateway image
+## image: build the unified reactantserver node image (large; needs the lib/ submodules checked out)
+image:
+	$(ENGINE) build -f docker/Dockerfile.worker -t $(NODE_IMAGE) .
+
+## gateway: build the slim pure-Julia gateway-only image
 gateway:
 	$(ENGINE) build -f docker/Dockerfile.gateway -t $(GATEWAY_IMAGE) .
 
-## worker: build the ReactantServer worker image (large; needs the lib/ submodules checked out)
-worker:
-	$(ENGINE) build -f docker/Dockerfile.worker -t $(WORKER_IMAGE) .
+## worker: alias for `make image`, additionally tagged $(WORKER_IMAGE) for the per-GPU layout
+worker: image
+	$(ENGINE) tag $(NODE_IMAGE) $(WORKER_IMAGE)
 
 ## loadgen: build the dummy-data load generator image (light; no Reactant)
 loadgen:
@@ -37,7 +43,7 @@ e2e:
 
 ## clean: remove the images built by this Makefile (ignores ones that are absent)
 clean:
-	-$(ENGINE) rmi $(GATEWAY_IMAGE) $(WORKER_IMAGE)
+	-$(ENGINE) rmi $(NODE_IMAGE) $(GATEWAY_IMAGE) $(WORKER_IMAGE)
 
 ## help: list the available targets
 help:

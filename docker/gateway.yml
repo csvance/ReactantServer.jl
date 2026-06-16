@@ -17,6 +17,25 @@ logging:
   level: "info"
   format: "json"
 
+# Request scheduling across workers. round_robin (default) spreads each model uniformly;
+# lpt_packing concentrates each model's traffic on few workers from measured load and
+# worker-reported compute cost, maximizing batch coalescing. lpt_packing requires worker
+# scheduler.discipline: fifo (node file) and all models loaded on all workers. The embedded
+# gateway reads the same knobs from REACTANT_GATEWAY_SCHEDULING_* environment variables.
+# scheduling:
+#   mode: lpt_packing         # round_robin | lpt_packing
+#   rebalance_seconds: 15.0   # placement recompute interval
+#   max_worker_share: 0.8     # max share of one worker a single model may claim
+#   hysteresis: 0.1           # min improvement required to move a placement
+
 endpoints:
   - "worker0:8080"
   - "worker1:8081"
+
+# Optional: the workers' Prometheus metrics addresses (metrics_base_port + index in the node
+# file). When listed, the gateway's /metrics aggregates every worker's export behind its own,
+# so one scrape target covers the whole deployment; workers tag their series with worker/gpu
+# labels themselves. The supervisor's embedded gateway wires this automatically.
+# metrics_endpoints:
+#   - "worker0:9100"
+#   - "worker1:9101"

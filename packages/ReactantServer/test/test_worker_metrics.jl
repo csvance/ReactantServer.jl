@@ -5,9 +5,10 @@
 
 using ReactantServer: WorkerMetrics, inc_request!, observe_request!, start_worker_metrics,
     Scheduler, ModelRegistry, ModelEntry, ModelSchedState, ModelSchedConfig, SchedulerConfig,
-    ServerConfig, RuntimeConfig, EndpointsConfig, CPU_BACKEND, ModelSignature, LoadedModel,
-    Manifest, TensorSpec, Dim, BatchingSpec, Provenance, FIXED, BATCH, F32, UNPINNED,
-    MockBackend, MockClient, MockDevice, MemoryPool, WeightCache
+    ServerConfig, RuntimeConfig, EndpointsConfig, CPU_BACKEND, CUDA_BACKEND, ModelSignature,
+    LoadedModel, Manifest, TensorSpec, Dim, BatchingSpec, Provenance, FIXED, BATCH, F32,
+    UNPINNED, MockBackend, MockClient, MockDevice, MemoryPool, WeightCache,
+    inject_metric_labels, _gpu_identity
 import Prometheus
 import HTTP
 
@@ -94,4 +95,56 @@ end
     finally
         close(server)
     end
+end
+
+@testset "worker metrics: label injection" begin
+    text = """
+    # HELP worker_dispatch_total Total dispatches per model.
+    # TYPE worker_dispatch_total counter
+    worker_dispatch_total{model="m"} 3
+    # TYPE worker_models_loaded gauge
+    worker_models_loaded 1
+    worker_request_latency_seconds_bucket{model="m",le="0.001"} 0
+    worker_info{worker="worker0",device_ordinal="0"} 1
+    """
+    out = inject_metric_labels(text, ["worker" => "worker0", "gpu" => "1"])
+    @test occursin("worker_dispatch_total{worker=\"worker0\",gpu=\"1\",model=\"m\"} 3", out)
+    @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"1\"} 1", out)
+    @test occursin("worker_request_latency_seconds_bucket{worker=\"worker0\",gpu=\"1\",model=\"m\",le=\"0.001\"} 0", out)
+    # An already-present key is not duplicated; missing keys are still added.
+    @test occursin("worker_info{gpu=\"1\",worker=\"worker0\",device_ordinal=\"0\"} 1", out)
+    # Comment lines pass through untouched.
+    @test occursin("# HELP worker_dispatch_total Total dispatches per model.", out)
+    @test inject_metric_labels(text, Pair{String,String}[]) == text
+
+    # The HTTP endpoint applies the labels to the real exposition.
+    sched, backend, pool, cfg = _wm_sched()
+    wm = WorkerMetrics(sched, backend, pool, cfg; worker_name="worker0")
+    port = grpc_free_port()
+    server = start_worker_metrics(wm, "127.0.0.1", port; ready_fn = () -> true,
+                                  worker_name="worker0", gpu="2")
+    try
+        body = String(HTTP.get("http://127.0.0.1:$port/metrics"; retry=false, readtimeout=5).body)
+        @test occursin("worker_dispatch_total{worker=\"worker0\",gpu=\"2\",model=\"m\"}", body)
+        @test occursin("worker_models_loaded{worker=\"worker0\",gpu=\"2\"}", body)
+    finally
+        close(server)
+    end
+end
+
+@testset "worker metrics: gpu identity" begin
+    cuda_cfg(ord) = ServerConfig(["."], "", RuntimeConfig(CUDA_BACKEND, ord, 0.9, true, true),
+        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0))
+
+    # The supervisor / per-GPU-container case: a single selector is the physical identity.
+    @test _gpu_identity(cuda_cfg(0), Dict("CUDA_VISIBLE_DEVICES" => "3")) == "3"
+    @test _gpu_identity(cuda_cfg(0), Dict("CUDA_VISIBLE_DEVICES" => "GPU-aaaa")) == "GPU-aaaa"
+    # Bare metal, several visible devices: the addressed ordinal's token.
+    @test _gpu_identity(cuda_cfg(1), Dict("CUDA_VISIBLE_DEVICES" => "4,5")) == "5"
+    # No CUDA_VISIBLE_DEVICES: the device ordinal is the best available identity.
+    @test _gpu_identity(cuda_cfg(2), Dict{String,String}()) == "2"
+    # CPU backend: no gpu label.
+    cpu = ServerConfig(["."], "", RuntimeConfig(CPU_BACKEND, 0, 0.9, true, true),
+        SchedulerConfig(30.0, 64, 30.0), EndpointsConfig("127.0.0.1", 0))
+    @test _gpu_identity(cpu, Dict("CUDA_VISIBLE_DEVICES" => "3")) == ""
 end

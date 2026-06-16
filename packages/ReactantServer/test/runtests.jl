@@ -1,4 +1,23 @@
 using Test
+
+# The package's LocalPreferences.toml pins Reactant's persistent compile cache to
+# /var/cache/reactant-compile (a Docker volume mount point), which is not writable on a dev
+# host and makes every CPU compile error with EACCES. Preferences are read at Reactant load
+# time from the load path with earlier entries taking precedence, so before loading
+# ReactantServer prepend an override that disables the persistent cache for this test process.
+# Test compiles are tiny; skipping the cache also keeps them deterministic.
+let prefdir = mktempdir()
+    write(joinpath(prefdir, "Project.toml"), """
+    [extras]
+    Reactant = "3c362404-f566-11ee-1572-e11a4b42c853"
+    """)
+    write(joinpath(prefdir, "LocalPreferences.toml"), """
+    [Reactant]
+    persistent_cache_enabled = false
+    """)
+    pushfirst!(LOAD_PATH, prefdir)
+end
+
 using ReactantServer
 
 include("stablehlo_fixtures.jl")
