@@ -40,7 +40,7 @@ Some user populations are better served by other tools. The project does not try
 - **Hyperscale platform requirements.** Organizations operating at the scale of thousands of GPUs need multi-tenant isolation, complex traffic shaping, and deep integration with bespoke internal platforms. Large deployments are a supported use case through the control-plane seam described above, which lets an organization bring exactly that machinery; what the project will not do is build it into the core, where every smaller deployment would pay for it.
 - **LLM serving at scale.** vLLM, TGI, TensorRT-LLM, and similar projects are purpose-built for that domain and do it well. This project does not compete in that market.
 - **Users who want a packaged solution.** This is infrastructure for builders, not a hosted service. Users who do not want to think about the underlying architecture should choose a managed inference service.
-- **Multi-framework deployments.** This project is XLA-centric. Teams that need to serve PyTorch, TensorFlow, and ONNX models side by side without converting them are better served by Triton or similar.
+- **Multi-framework deployments.** This project is Reactant-centric: a model must be lowered by Reactant to a device executable first (today via StableHLO/XLA). Teams that need to serve PyTorch, TensorFlow, and ONNX models side by side without converting them are better served by Triton or similar.
 - **Research and rapid prototyping workflows.** The project is for production serving. Eager-mode debugging, dynamic graphs, and interactive iteration are not what it optimizes for.
 
 If you fall into any of these categories, the project is not aimed at you, and that is a feature rather than a deficiency.
@@ -51,7 +51,7 @@ In approximate priority order:
 
 1. **Economic efficiency per GPU.** Models served per GPU, watts per inference, dollars per million requests. These are the metrics that matter for the target audience.
 2. **Predictable, deterministic resource use.** Pre-allocated memory pools, static buffer assignment, no surprise allocations. Predictability matters for regulated deployments and for operators who need to size their hardware confidently.
-3. **Compiler-grade optimization.** Whole-program XLA optimization, kernel fusion across operations, layout planning. This is the leverage that lets small teams approach big-tech efficiency.
+3. **Compiler-grade optimization.** Whole-program compiler optimization (XLA today), kernel fusion across operations, layout planning. This is the leverage that lets small teams approach big-tech efficiency.
 4. **A hackable, Julia-first stack.** The serving path, scheduler, gateway, client, and export tooling are plain Julia. There is no opaque core wrapped in scripting glue: the code a lab reads is the code that runs, so behavior can be inspected with the language's own tools and modified without a second toolchain. Elegance here is not aesthetics; it is the property that makes the system adoptable off the shelf and bendable when the shelf does not fit.
 5. **Operator clarity.** Operators should be able to read configuration files, inspect bundles, understand scheduler behavior, and debug failures without reverse-engineering the system. The architecture is legible.
 6. **Verification scope.** The codebase is small enough to audit. Dependencies are bounded and stable. The system is suitable for regulated environments without heroic compliance effort.
@@ -60,7 +60,7 @@ In approximate priority order:
 
 - **Convenience over efficiency.** When a choice trades runtime cost for developer convenience, efficiency wins by default. Users who prefer the opposite tradeoff have other tools.
 - **Maximum generality.** The project is opinionated about its design point. It does not try to be the inference server for every use case.
-- **Compatibility with all upstream frameworks.** XLA-compatible models work; others do not. The conversion tooling makes this boundary as friendly as possible, but the boundary is real.
+- **Compatibility with all upstream frameworks.** Models Reactant can trace and lower work (today via StableHLO/XLA); others do not. The conversion tooling makes this boundary as friendly as possible, but the boundary is real.
 - **Featureful APIs.** The server's API surface is small on purpose. Each addition is weighed against the cost of the cognitive load it imposes on every user, not just the users who would benefit.
 
 ## What features will not be considered

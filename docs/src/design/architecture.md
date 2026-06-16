@@ -2,12 +2,17 @@
 
 ## What it is
 
-ReactantServer is a production inference server that serves many compiled XLA models from a single
-Julia process on one GPU. Models are delivered as self-contained bundles (a StableHLO program,
-its weights, and a manifest), compiled once through Reactant.jl's PJRT bindings, and served over
-the KServe V2 inference API via gRPC, so standard Triton and KServe clients connect without
-changes. It targets static-graph workloads such as computer vision and scientific computing,
-where many models share a GPU and one model executes at a time.
+ReactantServer is a production inference server that serves many models compiled through
+Reactant.jl from a single Julia process on one GPU. Models are delivered as self-contained
+bundles (an MLIR module, its weights, and a manifest), compiled once through Reactant's PJRT
+bindings, and served over the KServe V2 inference API via gRPC, so standard Triton and KServe
+clients connect without changes. It targets static-graph workloads such as computer vision and
+scientific computing, where many models share a GPU and one model executes at a time.
+
+The server is Reactant-centric, not XLA-specific: it runs whatever Reactant can lower to a device
+executable. Today that means StableHLO compiled by XLA — the only dialect and backend currently
+wired up, so in practice the focus is XLA — but the architecture is not bound to XLA, and any MLIR
+dialect Reactant exposes would serve the same way.
 
 ## Package layout
 
@@ -45,11 +50,11 @@ lowers cost per inference. Two technical levers deliver this:
    keeps every model's weights resident in host RAM and moves a model's weights onto the GPU
    only when it is needed, evicting cold models to stay within a memory budget. This decouples
    the number of servable models from GPU memory capacity.
-2. **Run each model faster with the XLA compiler.** Each model is compiled ahead of time into an
-   optimized executable. XLA performs whole-program optimization, fuses kernels across
-   operations, and plans memory layout, which makes execution significantly faster than running
-   the equivalent eager-mode graph. Small teams get compiler-grade performance without building
-   it themselves.
+2. **Run each model faster with an ahead-of-time compiler.** Each model is compiled once into an
+   optimized executable (XLA today). The compiler performs whole-program optimization, fuses
+   kernels across operations, and plans memory layout, which makes execution significantly faster
+   than running the equivalent eager-mode graph. Small teams get compiler-grade performance
+   without building it themselves.
 
 The broader mission, the target audience, and the explicit non-goals are on the
 [Philosophy](philosophy.md) page. Operational and format details are in the
@@ -193,12 +198,13 @@ is typed YAML with environment-variable overrides. The scheduler exposes per-mod
 dispatch count, total compute, current recent-compute load, queue depth, queue-wait percentiles,
 and the histogram of coalesced batch sizes, plus weight cache residency and load/evict counters.
 
-## The XLA compiler advantage
+## The compiler advantage
 
 Serving static graphs through an ahead-of-time compiler is the project's second source of
-leverage. Each StableHLO module is compiled once into a device executable. XLA optimizes the
-whole program rather than one operation at a time: it fuses adjacent operations into single
-kernels, eliminates redundant work, and plans tensor layouts for the target device. The result
+leverage. Reactant lowers each model to an MLIR module that is compiled once into a device
+executable; today that is StableHLO compiled by XLA. The compiler optimizes the whole program
+rather than one operation at a time: it fuses adjacent operations into single kernels, eliminates
+redundant work, and plans tensor layouts for the target device. The result
 executes substantially faster than the same model run eagerly, and the cost is paid once at
 startup rather than on every request. A bundle may carry several compiled batch sizes that share
 one set of weights, so the scheduler can pick the executable that matches each coalesced batch
@@ -208,6 +214,6 @@ without duplicating parameters.
 
 ReactantServer is opinionated and deliberately narrow. It is for small and mid-size engineering
 organizations that need efficient inference on static-graph models and that measure their own
-systems. It is XLA-centric and is not a general multi-framework server, not an LLM serving
-stack, and not a managed service. The reasoning behind these boundaries is on the
-[Philosophy](philosophy.md) page.
+systems. It is Reactant-centric — currently focused on StableHLO/XLA — and is not a general
+multi-framework server, not an LLM serving stack, and not a managed service. The reasoning behind
+these boundaries is on the [Philosophy](philosophy.md) page.

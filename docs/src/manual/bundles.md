@@ -5,8 +5,8 @@ CurrentModule = ReactantServer
 # Bundles & model.jl
 
 A model is delivered to the server as a self-contained bundle: a directory holding a compiled
-StableHLO program, its weights, and a manifest. Bundles are produced offline by the conversion
-tooling and loaded at server startup.
+model (an MLIR module Reactant compiles, a StableHLO program today), its weights, and a manifest.
+Bundles are produced offline by the conversion tooling and loaded at server startup.
 
 ## Bundle layout
 
@@ -14,8 +14,9 @@ A bundle is a directory containing:
 
 - `manifest.yaml` — the metadata parsed into a [`Manifest`](@ref): I/O specs, dtypes, shapes,
   and the compiled batch sizes.
-- `model.mlir` — a serialized StableHLO portable artifact (single batch size), or one module
-  per size as `model.b{N}.mlir` sharing a single `weights.safetensors`.
+- `model.mlir` — the MLIR module Reactant compiles, currently a serialized StableHLO portable
+  artifact (single batch size), or one module per size as `model.b{N}.mlir` sharing a single
+  `weights.safetensors`.
 - `weights.safetensors` — the model weights, memory-mapped at load time.
 - `model.jl` — optional; registers custom pre/post-processing (see below).
 

@@ -4,8 +4,8 @@ CurrentModule = ReactantServer
 
 # ReactantServer.jl
 
-A production inference server that serves compiled XLA models from a single Julia process,
-built on Reactant.jl's PJRT bindings. It targets static-graph workloads (computer vision,
+A production inference server that serves models compiled through Reactant.jl — StableHLO via
+XLA today — from a single Julia process, built on Reactant's PJRT bindings. It targets static-graph workloads (computer vision,
 scientific computing) where many models share one GPU and only one model executes at a time.
 To serve more models than fit in GPU memory at once, it keeps every model's weights resident
 in host RAM and transfers them onto the GPU on demand, evicting cold models under a memory
