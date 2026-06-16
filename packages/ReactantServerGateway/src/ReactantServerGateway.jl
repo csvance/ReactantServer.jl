@@ -69,6 +69,15 @@ struct RunningGateway
     server::Any
 end
 
+# HTTP/2 receive flow-control windows the gateway advertises to its clients. The protocol default
+# is only 64 KiB per stream and per connection, which throttles a large inline-tensor *upload*
+# (the client's inference request) to ~window/RTT. Match the gRPC client (libcurl), which
+# advertises a large receive window by default, so the receive path is not the bottleneck; the
+# connection window also bounds total in-flight DATA across streams. Hardcoded for now; intended
+# to become config/env-tunable later.
+const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
+const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
+
 """
     serve_gateway(gateway_path=nothing; blocking=true) -> nothing | RunningGateway
 
@@ -119,10 +128,14 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     @info "Starting reactant-gateway" grpc = cfg.listen_grpc metrics = cfg.listen_metrics endpoints = cfg.workers
 
     if blocking
-        gRPCServer.serve(router, host, port; context = state)
+        gRPCServer.serve(router, host, port; context = state,
+            h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
+            h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
         return nothing
     end
-    server = gRPCServer.serve!(router, host, port; context = state)
+    server = gRPCServer.serve!(router, host, port; context = state,
+        h2_initial_window_size = _H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size = _H2_CONNECTION_WINDOW_BYTES)
     return RunningGateway(cfg, pool, routes, gate, metrics, admin, prober, server)
 end
 

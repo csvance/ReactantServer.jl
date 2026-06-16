@@ -140,10 +140,23 @@ ReactantServerClient.output_specs(io::DummyIO) = io.spec.out_specs
 
 const N_OK   = Atomic{Int}(0)
 const N_ERR  = Atomic{Int}(0)
-const LAT_NS = Atomic{Int}(0)        # cumulative successful-request latency, nanoseconds
-const LAT_MX = Atomic{Int}(0)        # max single-request latency this window, ns (reset each report)
+const LAT_NS = Atomic{Int}(0)        # cumulative successful-request latency, ns (overall summary)
+const LAT_SAMPLES = Int[]            # per-window latency samples, ns; drained each report
+const LAT_LOCK = ReentrantLock()     # guards LAT_SAMPLES
 const ERR_SAMPLES = String[]
 const ERR_LOCK = ReentrantLock()
+
+# Linear-interpolated quantile (type 7, matching Statistics.quantile's default) over an already
+# sorted vector; no external dependency. q in [0, 1].
+function _quantile_sorted(sorted::Vector{Int}, q::Float64)
+    n = length(sorted)
+    n == 0 && return 0.0
+    n == 1 && return Float64(sorted[1])
+    h = (n - 1) * q + 1
+    lo = clamp(floor(Int, h), 1, n)
+    lo >= n && return Float64(sorted[n])
+    return sorted[lo] + (h - lo) * (sorted[lo + 1] - sorted[lo])
+end
 
 function record_err(err)
     atomic_add!(N_ERR, 1)
@@ -162,11 +175,7 @@ function fire(spec::ModelSpec, use_shm::Bool)
     dt = Int(time_ns() - t0)
     atomic_add!(N_OK, 1)
     atomic_add!(LAT_NS, dt)
-    while true                                   # lock-free max update
-        old = LAT_MX[]
-        dt <= old && break
-        atomic_cas!(LAT_MX, old, dt) == old && break
-    end
+    @lock LAT_LOCK push!(LAT_SAMPLES, dt)        # window sample for the distribution stats
     return nothing
 end
 
@@ -213,23 +222,32 @@ function main()
 
     reporter = Threads.@spawn begin
         last_ok = 0
-        last_lat = 0
         last_t = time()
         err_shown = false
         while time() < deadline
             sleep(REPORT_SEC)
             now = time()
-            ok = N_OK[]; err = N_ERR[]; lat = LAT_NS[]
+            ok = N_OK[]; err = N_ERR[]
             d_ok = ok - last_ok
-            d_lat = lat - last_lat
             rps = d_ok / max(now - last_t, 1e-6)
-            # Per-window mean and max so the distribution reflects this window, not the whole run.
-            # In particular the one-time startup-compile spike no longer pins the max forever:
-            # read-and-reset the window max with atomic_xchg!. `ok`/`err` stay cumulative totals.
-            mean_ms = d_ok > 0 ? (d_lat / d_ok) / 1e6 : 0.0
-            max_ms = atomic_xchg!(LAT_MX, 0) / 1e6
-            println("[t+$(round(Int, now - (deadline - DURATION)))s] ok=$ok err=$err rps=$(round(rps, digits=1)) ",
-                    "mean=$(round(mean_ms, digits=1))ms max=$(round(max_ms, digits=1))ms")
+            # Distribution over the requests completed THIS window: drain the samples (so a one-time
+            # startup-compile spike only shows in its own window, never pinning later windows) and
+            # report min / median / p95 / max plus the mean. `ok`/`err` stay cumulative totals.
+            window = @lock LAT_LOCK begin
+                s = copy(LAT_SAMPLES); empty!(LAT_SAMPLES); s
+            end
+            sort!(window)
+            n = length(window)
+            ms(x) = round(x / 1e6, digits = 2)
+            stamp = round(Int, now - (deadline - DURATION))
+            if n == 0
+                println("[t+$(stamp)s] ok=$ok err=$err rps=$(round(rps, digits=1)) (no completions this window)")
+            else
+                mean_ms = ms(sum(window) / n)
+                println("[t+$(stamp)s] ok=$ok err=$err rps=$(round(rps, digits=1)) ",
+                        "mean=$(mean_ms)ms min=$(ms(window[1]))ms p50=$(ms(_quantile_sorted(window, 0.5)))ms ",
+                        "p95=$(ms(_quantile_sorted(window, 0.95)))ms max=$(ms(window[n]))ms")
+            end
             # Surface the failure cause as soon as errors appear instead of only at soak end.
             if !err_shown && err > 0
                 sample = @lock ERR_LOCK (isempty(ERR_SAMPLES) ? "(no sample captured)" : ERR_SAMPLES[1])
@@ -237,7 +255,7 @@ function main()
                 err_shown = true
             end
             scrape_metrics()
-            last_ok = ok; last_lat = lat; last_t = now
+            last_ok = ok; last_t = now
         end
     end
 

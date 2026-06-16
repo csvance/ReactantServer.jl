@@ -153,9 +153,13 @@ function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), bl
     end
     @info "Starting gRPC control plane" host = cfg.endpoints.host port = cfg.endpoints.port metrics_port = cfg.endpoints.metrics_port models = model_names(registry)
     if blocking
-        _G.serve(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx)
+        _G.serve(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
+            h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
+            h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
         return nothing
     end
-    server = _G.serve!(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx)
+    server = _G.serve!(router, cfg.endpoints.host, cfg.endpoints.port; context=ctx,
+        h2_initial_window_size=_H2_INITIAL_WINDOW_BYTES,
+        h2_connection_window_size=_H2_CONNECTION_WINDOW_BYTES)
     return RunningServer(cfg, registry, sched, pool, shm, server, cfg.endpoints.port, watcher, metrics_server)
 end

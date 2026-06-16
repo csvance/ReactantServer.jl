@@ -19,6 +19,15 @@ const _SERVER_EXTENSIONS = String["system_shared_memory"]
 # are not rejected with RESOURCE_EXHAUSTED. Shared-memory-backed tensors stay small on the wire.
 const _MAX_MESSAGE_BYTES = 512 * 1024 * 1024
 
+# HTTP/2 receive flow-control windows the server advertises. The protocol default is only 64 KiB
+# per stream and per connection, which throttles a large inline-tensor *upload* (the inference
+# request) to ~window/RTT and gates it on WINDOW_UPDATE round-trips. The gRPC client (libcurl)
+# already advertises a large receive window by default (nghttp2's "huge window"), so we match it
+# on the server's receive path; the connection window also caps total in-flight DATA across
+# streams, bounding buffering. Hardcoded for now; intended to become config/env-tunable later.
+const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
+const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
+
 # Per-request state threaded through gRPCServer's context payload. `metrics` is `nothing` only for
 # control-plane-only contexts (e.g. tests that never serve inference); `serve` always supplies it.
 struct InferContext
