@@ -11,14 +11,14 @@ where many models share a GPU and one model executes at a time.
 
 ## Package layout
 
-The project is a Julia workspace of four packages (plus the non-member `ReactantServerExport`
+The project is a Julia workspace of five packages (plus the non-member `ReactantServerExport`
 for offline bundle export), split so that talking to a server never requires the heavy
 Reactant/XLA stack:
 
 - **ReactantServerCore** — the shared, Reactant-free substrate: the dtype vocabulary, the
   KServe V2 protobuf messages, the transport-agnostic boundary types, the manifest parser,
-  server/cluster config, the wire codec, the shared-memory registry, and the
-  concurrency-safe staging `BufferPool`. The other three packages all build on it.
+  server/node config, the wire codec, the shared-memory registry, and the
+  concurrency-safe staging `BufferPool`. The other packages all build on it.
 - **ReactantServer** — the inference worker. It owns the model registry, the runtime, the
   scheduler, and the KServe V2 gRPC server, and is the **only** package that loads Reactant.
   Exports `serve`, `serve_worker`, `stop!`, `register_model`.
@@ -27,6 +27,9 @@ Reactant/XLA stack:
 - **ReactantServerClient** — the inference client (`KServeModel`, `infer_sync`,
   `infer_async`, `InferInput`, `InferOutput`). Also Reactant-free, so it installs on a plain
   client machine. See [Client Usage](../manual/client_usage.md).
+- **ReactantServerNode** — the single-container node supervisor (`supervise`). It detects the
+  visible GPUs and runs one worker subprocess per device, plus the embedded gateway when there
+  is more than one worker. Reactant-free (it only orchestrates subprocesses).
 
 The offline model-export tooling (`packages/ReactantServerExport`, with a PythonCall-triggered
 PyTorch extension) is not a workspace member; it produces bundles the worker consumes.
@@ -51,7 +54,7 @@ lowers cost per inference. Two technical levers deliver this:
 The broader mission, the target audience, and the explicit non-goals are on the
 [Philosophy](philosophy.md) page. Operational and format details are in the
 [Getting Started](../manual/getting_started.md) and
-[Cluster Configuration](../manual/cluster_config.md) guides.
+[Node Configuration](../manual/node_config.md) guides.
 
 ## How it fits together
 
@@ -59,12 +62,15 @@ The broader mission, the target audience, and the explicit non-goals are on the
   (`model.b{N}.mlir`, one per compiled batch size), a shared `weights.safetensors`, and an
   optional `model.jl` for pre/post-processing. Bundles are produced by offline conversion
   tooling from Lux or PyTorch models and loaded at server startup.
-- **One process per GPU.** Each worker drives a single GPU, holds a single shared memory pool,
-  and serves the full KServe V2 gRPC surface on its own. For multi-GPU deployments a thin
-  gateway gives clients one endpoint and schedules each model's traffic across workers, either
-  uniformly (round robin) or by adaptive memory-aware placement (`lpt_packing`); see the
-  [Multi-GPU Gateway](../manual/multi_gpu_gateway.md) guide. A single-GPU deployment needs no
-  gateway.
+- **One process per GPU, one container per node.** Each worker drives a single GPU, holds a
+  single shared memory pool, and serves the full KServe V2 gRPC surface on its own. A node
+  supervisor (`ReactantServerNode`) runs the whole node from one container: it detects the
+  visible GPUs and starts one worker process per device. With a single worker it binds that
+  worker to the public ports directly (no gateway); with two or more it also starts a thin
+  embedded gateway that gives clients one endpoint and routes each model's traffic across
+  workers, either uniformly (round robin) or by adaptive memory-aware placement (`lpt_packing`).
+  See the [Scaling to Multiple GPUs](../manual/scaling.md) and
+  [Multi-GPU Gateway](../manual/multi_gpu_gateway.md) guides.
 - **Weights as explicit arguments.** Weights are passed to the compiled executable as arguments
   rather than baked into it. This is what makes on-demand loading and weight sharing across
   batch sizes possible: compilation is independent of where the weights currently live.
@@ -111,11 +117,17 @@ How the set of loaded models changes over a worker's lifetime is set by `model_c
 ## The scheduler
 
 The scheduler is the component that decides, each time the GPU is free, which model to run next
-and how many queued requests to serve in one execution. It is a deficit-weighted, cost-aware,
-coalescing dispatch policy that runs on top of the language task scheduler and
-adds no threading of its own. Exactly one GPU execution runs at a time by design, which keeps
-memory and concurrency reasoning simple and is what makes the single-resident-model strategy
-above safe.
+and how many queued requests to serve in one execution. It coalesces queued requests and
+dispatches one model at a time under a configurable inter-model `discipline`, runs on top of the
+language task scheduler, and adds no threading of its own. Exactly one GPU execution runs at a
+time by design, which keeps memory and concurrency reasoning simple and is what makes the
+single-resident-model strategy above safe.
+
+Two disciplines are supported. `fair` (the default) is a deficit-weighted, cost-aware share that
+balances GPU time across models on the worker. `fifo` ignores per-model weights and serves in
+global arrival order; it is the right choice when the worker sits behind a gateway running
+`lpt_packing`, which moves the placement and fairness decisions upstream (the two would otherwise
+fight). Coalescing applies under both.
 
 ### Structure
 
@@ -130,23 +142,21 @@ arriving during a running inference.
 
 Each time the GPU frees up, the scheduler decides in this order:
 
-1. **Fairness.** Each model has a relative weight that defines its fair share of
-   compute. The scheduler tracks a decaying exponential moving average of how much GPU time each
-   model has recently consumed, and scores every model with a non-empty queue by how far below
-   its fair share it is, divided by its estimated cost. A model that has used less than its share
-   recently scores higher, and dividing by cost stops an expensive model from blocking cheaper
-   ones on a marginal fairness edge. A clamp bounds both lockout and domination. Under the
-   alternative `fifo` discipline, the model with the oldest queued request wins instead; choose
-   it when workers sit behind a gateway running `lpt_packing`, which moves the placement and
-   fairness decisions upstream (see the
-   [Multi-GPU Gateway](../manual/multi_gpu_gateway.md) guide).
+1. **Select the next model**, according to the configured `discipline`. Under `fair` (the
+   default), each model has a relative weight that defines its share of compute; the scheduler
+   tracks a decaying exponential moving average of how much GPU time each model has recently
+   consumed, and scores every model with a non-empty queue by how far below its share it is,
+   divided by its estimated cost. A model that has used less than its share recently scores
+   higher, and dividing by cost stops an expensive model from blocking cheaper ones on a marginal
+   edge; a clamp bounds both lockout and domination. Under `fifo`, weights are ignored and the
+   model with the oldest queued request wins (chosen behind an `lpt_packing` gateway, as above).
 2. **Coalesce the winner.** The selected model's queued requests are taken in FIFO order and
    packed into the largest compiled batch size that fits, padding a partial batch up to the
    smallest size when needed and always making forward progress on at least the oldest request.
    The remainder stays queued for the next round.
 
-Per-model latency budgets (earliest-deadline-first escalation ahead of fairness) are a planned
-extension; they are not implemented today.
+Per-model latency budgets (earliest-deadline-first escalation ahead of the discipline) are a
+planned extension; they are not implemented today.
 
 ### Cost learning and coalescing
 
@@ -165,13 +175,13 @@ triples.
 
 ### Configuration and observability
 
-Per model, operators set a relative weight, the residency floor, and whether the model is
-pinned to the GPU. Globally they set the recent-compute half-life, the cost estimate smoothing,
-a coalescing cost discount, a per-model maximum queue depth, and the GPU weight-cache byte
-budget. Configuration is typed YAML with environment-variable overrides. The scheduler exposes
-per-model metrics: dispatch count, total compute, current recent-compute load,
-queue depth, queue-wait percentiles, and the histogram of coalesced batch sizes, plus weight
-cache residency and load/evict counters.
+Per model, operators set a relative weight (used by the `fair` discipline), the residency floor,
+and whether the model is pinned to the GPU. Globally they set the `discipline`, the
+recent-compute half-life and a coalescing cost discount (both `fair`-only), the cost estimate
+smoothing, a per-model maximum queue depth, and the GPU weight-cache byte budget. Configuration
+is typed YAML with environment-variable overrides. The scheduler exposes per-model metrics:
+dispatch count, total compute, current recent-compute load, queue depth, queue-wait percentiles,
+and the histogram of coalesced batch sizes, plus weight cache residency and load/evict counters.
 
 ## The XLA compiler advantage
 

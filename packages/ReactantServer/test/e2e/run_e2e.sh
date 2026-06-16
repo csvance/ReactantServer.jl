@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end test of the full serving stack: ensure the gateway/worker images exist, bring up
-# two GPU workers plus the gateway via podman compose, run the client over both the TCP and the
-# shared-memory data paths, then tear the stack down. Run from anywhere; paths resolve relative
-# to the repository root.
+# End-to-end test of the full serving stack: ensure the node image exists, bring up one
+# supervised container driving two GPUs (worker0 + worker1 + embedded gateway) via podman
+# compose, run the client over both the TCP and the shared-memory data paths, then tear the
+# stack down. Run from anywhere; paths resolve relative to the repository root.
 set -euo pipefail
 
 # This script lives at packages/ReactantServer/test/e2e/; the repo root is four levels up.
@@ -41,9 +41,8 @@ julia --project=packages/ReactantServer "$E2E_DIR/gen_scale4.jl"
 echo "== [3/6] generating bit_resnet50 bundle (Luximm, random init) =="
 julia --project="$E2E_DIR" "$E2E_DIR/gen_bit_resnet50.jl"
 
-echo "== [4/6] ensuring images (build if missing) =="
-"$ENGINE" image exists reactantserver-worker:latest  || make worker
-"$ENGINE" image exists reactantserver-gateway:latest || make gateway
+echo "== [4/6] ensuring image (build if missing) =="
+"$ENGINE" image exists reactantserver:latest || make image
 
 echo "== [5/6] bringing up stack =="
 "${COMPOSE[@]}" up -d

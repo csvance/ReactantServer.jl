@@ -12,10 +12,8 @@ The efficiency half is concrete. GPU memory accounts for roughly two thirds of G
 
 Small and mid-size labs and engineering organizations who need big-tech-level efficiency without big-tech scale. Concretely, this includes:
 
-- Medical device and regulated industry teams running inference on constrained on-board hardware.
-- Scientific computing and research groups operating within bounded compute budgets.
 - Startups and small companies serving production ML where each GPU is a meaningful fraction of infrastructure spend.
-- Industrial automation, robotics, and edge inference deployments with hard cost-per-unit targets.
+- Scientific computing and research groups operating within bounded compute budgets.
 - On-premise deployments where hardware is already purchased and underutilization is wasted capacity.
 - Cloud deployments where GPU-hours are the dominant cost line.
 
@@ -91,25 +89,3 @@ Proposals are evaluated against the mission, not against the proposer's preferen
 - Performance regressions, especially with reproducers. The project takes performance as a feature, not as an afterthought.
 
 Contributions are weighed against the mission. Changes that improve efficiency, reduce cognitive load, or make the project more useful to the target audience are likely to land. Changes that move in the opposite direction are unlikely to, regardless of how well-implemented they are.
-
-## On forking
-
-If the project does not fit your needs and the changes that would make it fit are out of scope, fork it. This is encouraged, not grudgingly tolerated.
-
-The license permits it. The codebase is intentionally small enough to be forkable by a competent team. The mission's clarity makes it easy to identify what a fork would need to change.
-
-Forks that address audiences the core project will not serve are good for the ecosystem. A fork optimized for hyperscale deployment, a fork with multi-framework backends, a fork with sandboxed extensions, a fork with whatever-you-need are all legitimate uses of the work, and the core project benefits from not having to be all of those things. Healthy upstream-downstream relationships exist throughout open-source infrastructure; this project should be no different.
-
-What you should not expect is that the core project will absorb a fork's divergent design back into mainline. The mission's durability depends on saying no to changes that compromise it, including well-intentioned ones from forks that have proven useful for their own audiences. If your fork is successful in its niche, that is the right outcome. The core project is not the only valid expression of the work.
-
-Upstream contributions that fit the mission remain welcome from anyone, including fork maintainers. Bug fixes, performance improvements, documentation, and features aligned with the core project's goals can flow back without friction. The boundary is the mission, not the contributor.
-
-## A note on tone
-
-This document is direct about who is and is not the target audience. That directness is intentional. Many open-source projects suffer from trying to be everything to everyone, and the result is a project that serves no one particularly well.
-
-The audience the project serves is real and underserved. Small and mid-size labs that need efficient inference infrastructure have historically had two options: use a general-purpose server like Triton that wastes capacity on their workload, or build their own from scratch. This project exists as a third option specifically for them: efficient enough to matter, and small and hackable enough to actually own. Being clear about that is not exclusionary; it is honest.
-
-Users who fall outside the target audience are not unwelcome; they are simply not who the project optimizes for. They are free to use it if it fits their needs, free to fork it if they need something the core project will not provide, free to ignore it if neither option works, and free to contribute if their interests align with the mission. What they should not expect is that the project will change shape to accommodate them.
-
-This document will be updated as the project evolves, but the mission itself is durable. Features come and go; the commitment to elegant, hackable, economically efficient model serving, built first for small and mid-size labs, does not.

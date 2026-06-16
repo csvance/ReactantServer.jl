@@ -1,18 +1,18 @@
 # Multi-GPU Gateway
 
-`reactant-gateway` is a gRPC reverse proxy that fronts several ReactantServer.jl workers behind one
+The gateway is a gRPC reverse proxy that fronts several ReactantServer.jl workers behind one
 KServe V2 gRPC endpoint. It is pure Julia, lives in its own package `ReactantServerGateway`
-(`ReactantServerGateway.serve_gateway`), and reuses `ReactantServerCore`'s cluster/config
-parsing and the generated KServe protobuf. Because it builds only on `ReactantServerCore` and
-the gRPC layer, the gateway carries no Reactant dependency.
+(`ReactantServerGateway.serve_gateway`), and reuses `ReactantServerCore`'s node/config parsing
+and the generated KServe protobuf. Because it builds only on `ReactantServerCore` and the gRPC
+layer, the gateway carries no Reactant dependency.
 
-In the standard single-node deployment you do not start the gateway yourself: the node
-supervisor ([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the container's
-default entry point) runs it as an embedded child and synthesizes its worker endpoint list from
-the node file. This page describes what that gateway does and how to run it standalone, which is
-needed only when workers and the gateway live on different hosts (see the `gateway` role in
-[Docker Deployment](@ref)). A single worker already serves the full KServe V2 gRPC API for its
-GPU, so a bare single-GPU deployment without the supervisor can also be addressed directly.
+You do not start the gateway yourself. When a node has two or more workers, the supervisor
+([`ReactantServerNode.supervise`](@ref ReactantServerNode.supervise), the container's default
+entry point) runs the gateway as an embedded child and synthesizes its worker endpoint list from
+the node file; a single-worker node skips it entirely (one worker already serves the full KServe
+V2 API). This page describes what that embedded gateway does. See
+[Scaling to Multiple GPUs](scaling.md) for when it appears and [Docker Deployment](@ref) for the
+container.
 
 Clients connect to a single gRPC endpoint. The gateway extracts the model name from each
 `ModelInferRequest` and forwards the raw protobuf bytes over gRPC to the worker that hosts that
@@ -83,7 +83,7 @@ traffic failing over to the remaining replicas immediately.
 `lpt_packing` has two preconditions, verified as a hard failure at gateway startup: every
 worker must run the `fifo` scheduler discipline (placement and fairness decisions move to the
 gateway, so workers should not re-order against it; see `scheduler.discipline` in
-[Cluster Configuration](cluster_config.md)), and every worker must serve the identical model
+[Node Configuration](node_config.md)), and every worker must serve the identical model
 set. Runtime drift degrades gracefully: a model temporarily missing from some workers is
 routed uniformly over its actual replicas with a warning until the fleet converges.
 
@@ -103,41 +103,19 @@ per second.
   or `REACTANT_GATEWAY_WORKERS`). Which models each worker serves is rediscovered continuously,
   but adding or removing workers requires a gateway restart.
 
-## Build
+## Configuration
 
-The standalone gateway image is built from the repository root (podman by default; Docker works
-too):
+The supervisor configures the embedded gateway for you: it synthesizes the worker endpoint list
+(and the worker metrics list) from the node file into `REACTANT_GATEWAY_WORKERS` /
+`REACTANT_GATEWAY_WORKER_METRICS`, and binds the gateway to the public ports (8001/8002). Nothing
+about model placement is configured on the gateway; it autodiscovers which models each worker
+serves via `RepositoryIndex` and refreshes its routing table periodically.
 
-```
-make gateway    # build the slim reactant-gateway image
-```
-
-The image is produced by `docker/Dockerfile.gateway` (see [Docker Deployment](docker.md)). It is
-built from the `ReactantServerGateway` member alone, so it pulls no Reactant/XLA stack. The
-unified node image (`make image`) also contains the gateway and runs it in the `gateway` role.
-
-## Run
-
-The supervisor starts the embedded gateway for you. To run a gateway standalone (the multi-node
-case), start the Julia workers first (one per GPU, each pointed at the same node file with a
-distinct `worker`, or a worker-role node container per host). Then run the gateway against its
-own `gateway.yml`:
-
-```julia
-using ReactantServerGateway
-ReactantServerGateway.serve_gateway("docker/gateway.yml")
-```
-
-The gateway is decoupled from the node files: `gateway.yml` (see `docker/gateway.yml` and
-[Cluster Configuration](cluster_config.md)) carries only the gateway's own settings plus a flat
-`endpoints:` list of worker `host:port` addresses, which may span any number of nodes. The
-gateway autodiscovers which models each endpoint serves via `RepositoryIndex`; nothing about
-model placement is configured on the gateway.
-
-Environment variables override the resolved config using the prefix `REACTANT_GATEWAY_` and the
-dotted path uppercased with underscores, for example `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or
-`REACTANT_GATEWAY_LISTEN_GRPC=0.0.0.0:8001`. `REACTANT_GATEWAY_WORKERS` (comma separated)
-replaces the endpoint list.
+To tune the gateway, mount a `docker/gateway.yml` over `/etc/reactantserver/gateway.yml` (or set
+`REACTANT_GATEWAY_FILE`); it carries the gateway's own settings (listen addresses, message
+limits, logging, and the `scheduling:` block above). Settings can also be overridden by
+environment with the prefix `REACTANT_GATEWAY_` and the dotted path uppercased with underscores,
+e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE=lpt_packing`.
 
 ## Operational notes
 

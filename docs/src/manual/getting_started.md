@@ -4,17 +4,23 @@ CurrentModule = ReactantServer
 
 # Getting Started
 
-This guide brings up a single worker, points a client at it, and shuts it down. A single GPU
-is just a one-worker cluster, so no gateway is involved.
+This is a complete walkthrough: export a small Lux model into a bundle, configure a single-GPU
+node, run it (both with `docker compose` and from pure Julia), and query it with the Julia
+client. When you are ready for more than one GPU, continue to
+[Scaling to Multiple GPUs](scaling.md).
+
+The commands below target a CUDA GPU host (`backend: cuda`, `--gpus all`). The runtime is device
+agnostic, so the same steps work on CPU by setting `backend: cpu` and dropping the GPU flags;
+that is handy for following along without a GPU.
 
 ## Installation
 
-ReactantServer is a Julia workspace of four packages under `packages/`, plus the non-member
-`ReactantServerExport` for offline bundle export (see
-[Architecture](../design/architecture.md)). It vendors its forked/unregistered
-dependencies (Reactant, gRPCServer, gRPCClient, HTTP) as git submodules under `lib/` and wires
-them in through the workspace `[sources]`. After cloning, populate the submodules and
-instantiate the workspace (this resolves all four members against one shared manifest):
+ReactantServer is a Julia workspace of five packages under `packages/` (`ReactantServerCore`,
+`ReactantServer`, `ReactantServerGateway`, `ReactantServerClient`, `ReactantServerNode`), plus the
+non-member `ReactantServerExport` for offline bundle export (see
+[Architecture](../design/architecture.md)). It vendors its forked/unregistered dependencies
+(Reactant, gRPCServer, gRPCClient, HTTP) as git submodules under `lib/` and wires them in through
+the workspace `[sources]`. After cloning, populate the submodules and instantiate the workspace:
 
 ```
 git submodule update --init --recursive
@@ -22,65 +28,146 @@ julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
 To work in a single package, activate its project instead, e.g.
-`julia --project=packages/ReactantServer`. The worker (`serve`) lives in `ReactantServer`; a
-client uses `ReactantServerClient` (see [Client Usage](client_usage.md)); the multi-GPU proxy
-(`serve_gateway`) lives in `ReactantServerGateway`.
+`julia --project=packages/ReactantServer`.
 
-The runtime is device agnostic. It defaults to CPU PJRT and selects CUDA through configuration,
-with CPU fallback, so you can develop and test without a GPU.
+## Step 1: Export a model into a bundle
 
-## Starting a worker
+A served model is a *bundle*: a directory with a `manifest.yaml`, a compiled StableHLO program
+(`model.mlir`), and its `weights.safetensors`. Bundles are produced offline by
+`ReactantServerExport`, which is not a workspace member (it carries Lux/PythonCall weak
+dependencies that the server image should not), so use its ready test environment:
 
-Configuration is a single node file (see [Cluster Configuration](cluster_config.md)). The
-shipped `docker/node.yaml` describes the layout. To serve:
-
-```julia
-using ReactantServer
-
-# Single-worker node: the worker name may be omitted.
-ReactantServer.serve("docker/node.yaml")
-
-# Multi-worker node: name the worker this process should serve.
-ReactantServer.serve("docker/node.yaml"; worker="worker0")
+```
+julia --project=packages/ReactantServerExport/test
 ```
 
-[`serve`](@ref) loads the configuration, brings up the runtime client, compiles the bundles
-assigned to the worker, starts the [`Scheduler`](@ref), and finally starts the gRPC server so
-traffic is accepted only once models and the scheduler are live. By default it blocks, serving
-until the process is stopped.
-
-## Running in the background
-
-Pass `blocking=false` to get a [`RunningServer`](@ref) handle and keep control of the REPL.
-Shut it down with [`stop!`](@ref):
+Export a tiny Lux MLP. The batch dimension is the last Julia axis (the Lux convention), so a
+4-feature input is `(4, batch)`:
 
 ```julia
-server = ReactantServer.serve("docker/node.yaml"; blocking=false)
-# ... issue requests against the configured host and port ...
+using Lux, ReactantServerExport, Random
+
+model = Lux.Chain(Lux.Dense(4 => 8, tanh), Lux.Dense(8 => 3))
+ps, st = Lux.setup(Random.Xoshiro(0), model)
+
+example = randn(Float32, 4, 1)            # (features, batch)
+ReactantServerExport.export_bundle(:lux, model, ps, st, example;
+    dir = joinpath("models", "mlp"), name = "mlp", batch_sizes = [1])
+```
+
+This writes `models/mlp/`: a `manifest.yaml`, the compiled StableHLO module (one per batch size,
+here `model.b1.mlir`), and `weights.safetensors`. The input tensor is named `input` and the
+output `output` by default (override with `input_name` / `output_name`); the client snippets
+below use those names. `models/` is now a model repository: every immediate subdirectory with a
+`manifest.yaml` is a servable model, keyed by its directory name (`mlp` here). See
+[Bundles & model.jl](bundles.md) for the manifest format and custom pre/post-processing.
+
+## Step 2: Configure a single-GPU node
+
+A deployment is described by one *node file*. The minimal single-GPU node needs only the model
+repository, a base port, the runtime backend, and one worker:
+
+```yaml
+# node.yaml
+model_repo: /var/lib/reactantserver/models
+base_port: 8080
+metrics_base_port: 9100
+
+global:
+  runtime:
+    backend: cuda         # use "cpu" to follow along without a GPU
+  endpoints:
+    host: 0.0.0.0
+
+workers:
+  - { name: worker0 }     # one worker on the (single) GPU
+```
+
+The explicit one-entry `workers:` list works with every run path below, including a bare
+`ReactantServer.serve` (which expects the workers list). Under the supervisor you can instead
+omit `workers:` and write `gpus: auto`, and it synthesizes one worker per detected GPU; that is
+how the image's baked default and [Scaling to Multiple GPUs](scaling.md) work. See
+[Node Configuration](node_config.md) for the full surface (scheduler, on-demand weights,
+per-model pinning, environment overrides).
+
+## Step 3: Run it with docker compose
+
+Build the image and start the node, pointing `REACTANTSERVER_MODELS` at the repository from
+Step 1:
+
+```
+make image
+REACTANTSERVER_MODELS=$PWD/models docker compose up
+```
+
+With a single GPU the node runs one worker and **no gateway**: the worker serves the KServe V2
+gRPC API on `localhost:8001` and metrics/health on `localhost:8002` (`/readyz`, `/healthz`,
+`/metrics`). The first start compiles every model before accepting traffic, so give it a moment;
+`curl localhost:8002/readyz` returns 200 once it is serving. See [Docker Deployment](docker.md)
+for the image, healthcheck, and metrics details.
+
+## Step 4: Or run it from pure Julia
+
+Two entry points, differing only in which ports are exposed:
+
+```julia
+# The supervisor: same behavior as the container. One worker (no gateway) on the public
+# ports 8001 (gRPC) and 8002 (metrics), just like `docker compose up`.
+using ReactantServerNode
+ReactantServerNode.supervise("node.yaml")
+```
+
+```julia
+# A single bare worker, no supervisor: serves on the node file's own port (base_port, 8080).
+using ReactantServer
+ReactantServer.serve("node.yaml")          # blocks; Ctrl-C to stop
+```
+
+[`serve`](@ref) loads the node file, brings up the runtime, compiles the worker's bundles, starts
+the [`Scheduler`](@ref), and finally starts the gRPC server so traffic is accepted only once
+models are live. Pass `blocking=false` to get a [`RunningServer`](@ref) you can [`stop!`](@ref):
+
+```julia
+server = ReactantServer.serve("node.yaml"; blocking=false)
+# ... issue requests ...
 ReactantServer.stop!(server)
 ```
 
-The default backend is `ReactantServer.ReactantBackend()`, which performs real compilation and
-execution. Any KServe V2 gRPC client can then call the server directly at the configured host
-and port.
+`supervise` is the right choice for deployment (it is what the container runs and it scales to
+many GPUs unchanged); a bare `serve` is convenient for a quick single-worker REPL session.
 
-## Connecting a client
+## Step 5: Query it
 
-The server speaks the KServe V2 (Open Inference Protocol) gRPC API natively, so a standard
-Triton or KServe gRPC client connects without changes. This repository ships one such client,
-the Reactant-free `ReactantServerClient` package; see [Client Usage](client_usage.md) for a
-worked example. Tensor data travels either inline (`raw_input_contents` / `raw_output_contents`)
-or through the Triton-compatible system shared-memory extension.
+The server speaks KServe V2 over gRPC, so any Triton/KServe client works; this repository ships
+the Reactant-free `ReactantServerClient`. Point it at the port your server is using (8001 for the
+supervisor or compose, 8080 for a bare `serve`), and use the bundle's tensor names `input` /
+`output`:
 
-### Shape convention
+```julia
+using ReactantServerClient
 
-Shape declarations in `manifest.yaml` and the server's internal [`NamedTensor`](@ref) data use
-the Julia column-major convention (the batch dimension is the last axis), which is the reverse
-of how Python/XLA writes the same tensor. The codec advertises and accepts KServe V2 wire
-shapes in their canonical row-major form, so Triton-style clients are unchanged; the underlying
-tensor bytes are identical under either view, and the codec converts by reshaping rather than
-permuting. See [Bundles & model.jl](bundles.md) for the einsum-style shape notation used in the
-manifest.
+kserve_init()
+try
+    model = KServeModel("grpc://127.0.0.1:8001", "mlp"; max_batch_size = 1)
+    x = Float32[1, 2, 3, 4]                       # one 4-feature item
+    response = infer_sync(model, [InferInput("input", x)])
+    y = InferOutput("output", response, Float32)  # length-3 output
+    @show vec(collect(y))
+finally
+    kserve_shutdown()
+end
+```
+
+See [Client Usage](client_usage.md) for batched inference over a dataset, IO validation, and the
+shared-memory data path.
+
+## Next steps
+
+- [Scaling to Multiple GPUs](scaling.md): add GPUs and how the supervisor decides what to start.
+- [Node Configuration](node_config.md): the full config surface and environment overrides.
+- [Bundles & model.jl](bundles.md): the bundle format and custom pre/post-processing.
+- [On-demand Weights](on_demand_weights.md): serving more models than fit in GPU memory.
+- [Docker Deployment](docker.md): the image, roles, health, and metrics.
 
 ## Testing
 
@@ -91,11 +178,5 @@ julia --project=packages/ReactantServerCore   -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServer        -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServerGateway -e 'using Pkg; Pkg.test()'
 julia --project=packages/ReactantServerClient  -e 'using Pkg; Pkg.test()'
+julia --project=packages/ReactantServerNode    -e 'using Pkg; Pkg.test()'
 ```
-
-## Next steps
-
-- [Cluster Configuration](cluster_config.md): the full config surface and overrides.
-- [Bundles & model.jl](bundles.md): how to package a model and add pre/post-processing.
-- [On-demand Weights](on_demand_weights.md): serving more models than fit in GPU memory.
-- [Multi-GPU Gateway](multi_gpu_gateway.md) and [Docker Deployment](docker.md): scaling out.

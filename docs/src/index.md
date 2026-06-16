@@ -46,7 +46,8 @@ export). See [Architecture](design/architecture.md) for the split.
 
 - New here? Start with [Getting Started](manual/getting_started.md).
 - Calling a server from your code: [Client Usage](manual/client_usage.md).
-- Configuring a deployment: [Cluster Configuration](manual/cluster_config.md).
+- Configuring a deployment: [Node Configuration](manual/node_config.md).
+- Scaling to multiple GPUs: [Scaling to Multiple GPUs](manual/scaling.md).
 - Packaging a model: [Bundles & model.jl](manual/bundles.md).
 - Serving more models than fit on the GPU: [On-demand Weights](manual/on_demand_weights.md).
 - Scaling across GPUs: [Multi-GPU Gateway](manual/multi_gpu_gateway.md) and

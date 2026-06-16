@@ -17,14 +17,14 @@
 #     -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
 #
 # Clients speak KServe V2 gRPC to :8001; metrics and health (/readyz, /metrics) are on :8002.
-# For multi-node deployments (workers and gateway on different hosts), see
-# docker-compose.multinode.yml.
+# With one GPU the supervisor runs a single worker (no gateway) on those ports; with more, it
+# runs one worker per GPU behind the embedded gateway. Either way the ports are the same.
 
 services:
   reactantserver:
     build:
       context: .
-      dockerfile: docker/Dockerfile.worker
+      dockerfile: docker/Dockerfile
     image: reactantserver:latest
     volumes:
       - ${REACTANTSERVER_MODELS:-./bundles}:/var/lib/reactantserver/models:ro

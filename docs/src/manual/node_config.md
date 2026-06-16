@@ -2,15 +2,16 @@
 CurrentModule = ReactantServer
 ```
 
-# Cluster Configuration
+# Node Configuration
 
-A deployment is described by a single cluster file. It is the only supported config format. It
-describes one or more single-GPU workers and, optionally, the gateway that fronts them. Each
-worker reads this same file, resolves its own entry by name, and loads (and can serve) every
-bundle in the shared model repository.
+A deployment is described by a single node file. It is the only supported config format. It
+describes one or more single-GPU workers on one machine and, optionally, the gateway that fronts
+them. Each worker reads this same file, resolves its own entry by name, and loads (and can serve)
+every bundle in the shared model repository.
 
-A single GPU is just a one-worker cluster: keep one entry under `workers:` and omit the
-`gateway:` block. Growing to more GPUs means adding workers, not changing the config format.
+A single GPU is just a one-worker node: keep one entry under `workers:` (or omit `workers:`
+entirely under the supervisor, below). Growing to more GPUs means adding workers, not changing
+the config format.
 
 Under the node supervisor (the container default, see [Docker Deployment](@ref)) the `workers:`
 list is optional: omit it and add `gpus: auto` (or an integer count, or an explicit device
@@ -172,5 +173,5 @@ INFERENCE_SERVER_RUNTIME_WEIGHT_CACHE_BYTES=8589934592
 ```
 
 List-valued overrides (`INFERENCE_SERVER_MODEL_DIRS`, `INFERENCE_SERVER_MODELS_INCLUDE`) are
-colon-separated. Overrides are applied on top of the resolved cluster config, and the effective
+colon-separated. Overrides are applied on top of the resolved node config, and the effective
 configuration is logged at startup.

@@ -1,19 +1,20 @@
-# ReactantServer.jl unified node image. The default entrypoint is the supervisor
-# (ReactantServerNode): it detects the visible GPUs, runs one worker subprocess per device plus
-# the embedded gateway, and multiplexes their logs, so a multi-GPU deployment is just
+# ReactantServer.jl node image. The default entrypoint is the supervisor (ReactantServerNode):
+# it detects the visible GPUs, runs one worker subprocess per device, and multiplexes their
+# logs. With two or more workers it also runs an embedded gateway; with a single worker it binds
+# that worker to the public ports directly. A multi-GPU deployment is just
 #
 #   docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
 #     -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
 #
-# Roles for multi-node setups (REACTANT_ROLE=all|workers|gateway) and the single-worker
-# entrypoint.worker.sh escape hatch are documented in docker/README.md.
+# The single-worker entrypoint.worker.sh escape hatch and the REACTANT_ROLE roles are documented
+# in docker/README.md.
 #
 # Build context is the repository root. The vendored dependencies are git submodules under
 # lib/ (Reactant.jl, gRPCServer.jl, gRPCClient.jl, HTTP.jl); run
 # `git submodule update --init --recursive` before building.
 #
 # Build (from the repo root):
-#   docker build -f docker/Dockerfile.worker -t reactantserver .
+#   docker build -f docker/Dockerfile -t reactantserver .   # or: make image
 
 FROM docker.io/library/julia:1.12.5-trixie
 

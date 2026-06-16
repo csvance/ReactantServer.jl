@@ -23,33 +23,27 @@ spawns one more worker.
 
 ## Files
 
-- `docker/Dockerfile.worker` — the unified `reactantserver` image (`julia:1.12.5-trixie`). It
-  copies the whole `packages/` tree and builds the workspace root (the shared `Manifest.toml`
-  pins the Reactant/HTTP forks). The default entry point is the supervisor;
-  `entrypoint.worker.sh` stays in the image as the single-worker escape hatch.
-- `docker/Dockerfile.gateway` — the slim, pure-Julia gateway-only image, for multi-node gateway
-  hosts. Built from the `ReactantServerGateway` member alone, so it pulls **no Reactant**.
+- `docker/Dockerfile` — the `reactantserver` image (`julia:1.12.5-trixie`). It copies the whole
+  `packages/` tree and builds the workspace root (the shared `Manifest.toml` pins the
+  Reactant/HTTP forks). The default entry point is the supervisor; `entrypoint.worker.sh` stays
+  in the image as the single-worker escape hatch.
 - `docker/entrypoint.node.sh` — the default entry point; launches the supervisor under
   `julia --handle-signals=no` (so its own SIGTERM/SIGINT handler runs) via `tini`.
 - `docker/entrypoint.worker.sh` — launches a single `ReactantServer.serve` worker named by
-  `REACTANT_WORKER_NAME`; used by the per-GPU-container layouts (the e2e stack), not the default.
-- `docker/entrypoint.gateway.sh` — launches `ReactantServerGateway.serve_gateway` against a
-  mounted gateway.yml (the standalone gateway image).
-- `docker/healthcheck.node.sh` — role-aware container healthcheck: curls the embedded gateway's
-  `/readyz` in the `all`/`gateway` roles, falls back to the Julia worker probe for `workers`.
+  `REACTANT_WORKER_NAME`; the single-worker escape hatch, not the default.
+- `docker/healthcheck.node.sh` — role-aware container healthcheck: curls the gateway's `/readyz`
+  in the `all`/`gateway` roles (for a single worker, the worker's own `/readyz`), falls back to
+  the Julia worker probe for `workers`.
 - `docker/healthcheck.worker.jl` — lightweight Julia readiness probe (imports only gRPCClient
   and YAML, never Reactant). With `REACTANT_WORKER_NAME` set it probes that worker; unset, it
   probes every worker in the node file and passes when at least one is ready.
 - `docker/node.default.yaml` — the zero-config node file baked into the image at
   `/etc/reactantserver/node.yaml` (`gpus: auto`, no `workers:` list).
 - `docker/node.yaml` — the fully commented node-file template to mount over the baked default
-  (see [Cluster Configuration](cluster_config.md)).
-- `docker/gateway.yml` — config for a standalone (multi-node) gateway: listen addresses, a
-  static worker `endpoints:` list, and an optional `metrics_endpoints:` list. The embedded
-  gateway needs no file; the supervisor synthesizes its endpoints.
+  (see [Node Configuration](node_config.md)).
+- `docker/gateway.yml` — optional config for the embedded gateway (scheduling knobs); the
+  supervisor synthesizes the worker endpoints, so the gateway needs no file by default.
 - `docker-compose.yml` — the single-service stack (equivalent to the `docker run` above).
-- `docker-compose.multinode.yml` — reference for multi-node: a `workers`-role node service plus
-  a standalone gateway service.
 
 ## Prerequisites
 
@@ -79,7 +73,7 @@ one line each, prefixed `[worker0]`, `[worker1]`, …, `[gateway]`, `[supervisor
 
 Zero configuration is the default: the baked node file sets `gpus: auto` and the supervisor
 synthesizes `worker0..workerN-1`, one per detected device. To customize, mount a node file over
-`/etc/reactantserver/node.yaml` (see [Cluster Configuration](cluster_config.md) for the full
+`/etc/reactantserver/node.yaml` (see [Node Configuration](node_config.md) for the full
 surface):
 
 - `gpus:` — `auto` (default), an integer count, or an explicit device list (ordinals or GPU
@@ -97,22 +91,13 @@ default unlimited, with the healthcheck reporting unready instead), `REACTANT_NO
 `workers:` list) to `/run/reactantserver/node.yaml` for inspection; children and the healthcheck
 read that file.
 
-## Roles (multi-node)
+## Roles
 
-`REACTANT_ROLE` selects what runs in the container:
-
-- `all` (default) — workers plus the embedded gateway. Publish 8001/8002; worker ports stay
-  internal unless you publish them. Single-host deployments need nothing else.
-- `workers` — workers only, for GPU nodes behind a remote gateway. Publish the per-worker port
-  ranges (`base_port`+*i*, `metrics_base_port`+*i*).
-- `gateway` — the gateway only. Mount a `gateway.yml` whose `endpoints:` lists every worker
-  across all nodes (or set `REACTANT_GATEWAY_WORKERS=host:port,...`). The slim
-  `reactantserver-gateway` image is equivalent and smaller.
-
-See `docker-compose.multinode.yml` for the reference topology and the
-[Multi-GPU Gateway](multi_gpu_gateway.md) page for the gateway's behavior. The KServe system
-shared-memory data plane assumes client and worker share a host; multi-node clients use the
-inline tensor path.
+`REACTANT_ROLE` selects what the supervisor runs; the default `all` (workers plus the embedded
+gateway, on one host) is what these guides cover. The `workers` and `gateway` roles exist to
+split a deployment across machines (GPU nodes behind a separate gateway host), but multi-node is
+not a shipped example here. See the [Multi-GPU Gateway](multi_gpu_gateway.md) page for the
+gateway's behavior.
 
 ## Health status
 
@@ -147,9 +132,7 @@ scrape_configs:
 
 Per-GPU and per-worker views fall out of the labels, e.g.
 `sum by (gpu) (rate(worker_dispatch_total[1m]))`. Per-endpoint scrape health is reported as
-`gateway_worker_metrics_up{endpoint=...}`. For a standalone gateway, list the workers' metrics
-addresses under `metrics_endpoints:` in `gateway.yml` (or
-`REACTANT_GATEWAY_WORKER_METRICS=host:port,...`) to get the same aggregated scrape.
+`gateway_worker_metrics_up{endpoint=...}`.
 
 ## Single-GPU soak test
 

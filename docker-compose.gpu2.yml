@@ -21,7 +21,7 @@ services:
   reactantserver:
     build:
       context: .
-      dockerfile: docker/Dockerfile.worker
+      dockerfile: docker/Dockerfile
     image: reactantserver:latest
     # Default entrypoint: the node supervisor. With a single GPU it runs one worker and no
     # gateway (a lone worker serves the full KServe V2 API itself), binding the public ports

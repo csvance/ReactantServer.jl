@@ -44,13 +44,14 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Manual" => [
-            "Getting Started"       => "manual/getting_started.md",
-            "Client Usage"          => "manual/client_usage.md",
-            "Cluster Configuration" => "manual/cluster_config.md",
-            "Bundles & model.jl"    => "manual/bundles.md",
-            "On-demand Weights"     => "manual/on_demand_weights.md",
-            "Multi-GPU Gateway"     => "manual/multi_gpu_gateway.md",
-            "Docker Deployment"     => "manual/docker.md",
+            "Getting Started"          => "manual/getting_started.md",
+            "Scaling to Multiple GPUs" => "manual/scaling.md",
+            "Client Usage"             => "manual/client_usage.md",
+            "Node Configuration"       => "manual/node_config.md",
+            "Bundles & model.jl"       => "manual/bundles.md",
+            "On-demand Weights"        => "manual/on_demand_weights.md",
+            "Multi-GPU Gateway"        => "manual/multi_gpu_gateway.md",
+            "Docker Deployment"        => "manual/docker.md",
         ],
         "Design" => [
             "Philosophy"   => "design/philosophy.md",

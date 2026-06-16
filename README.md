@@ -127,24 +127,23 @@ docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
 ```
 
 Clients speak KServe V2 gRPC to `:8001`; health and metrics are on `:8002`. See `docker/README.md`
-for configuration, multi-node roles (`REACTANT_ROLE=all|workers|gateway`), and metrics.
+for configuration, roles, and metrics.
 
 Underneath, each worker is a single Julia process that drives one GPU and serves the complete
-KServe V2 gRPC surface on its own. For a single-GPU bare-metal deployment that is all you need:
-point your KServe V2 gRPC client straight at the worker's host and port.
+KServe V2 gRPC surface on its own. For a single-GPU deployment that is all the supervisor runs:
+one worker bound to the public ports, no gateway.
 
 The gateway reverse proxy exists for **multi-GPU configurations**. Because a worker hosts one
 GPU and executes one model at a time, scaling across several GPUs means running one worker per
-GPU and spreading models across them. The gateway gives clients a single gRPC endpoint and
-routes each `ModelInferRequest` to a worker serving the requested model, forwarding the protobuf
-bytes unchanged. Replica scheduling is set by `scheduling.mode`: `round_robin` (the default)
-spreads requests uniformly, while `lpt_packing` derives an adaptive memory-aware placement from
-live measurements, concentrating each model's traffic so worker-side batch coalescing fills (it
-requires workers running the `fifo` scheduler discipline). A standalone gateway is configured by
-its own `gateway.yml` (a flat list of worker endpoints across one or more nodes) and
-autodiscovers which models each endpoint serves via `RepositoryIndex`, refreshing its routing
-table periodically; the supervisor's embedded gateway is configured automatically from the node
-file. The gateway is pure Julia, in its own `ReactantServerGateway` package
+GPU and spreading models across them, and the supervisor then runs an embedded gateway that gives
+clients a single gRPC endpoint and routes each `ModelInferRequest` to a worker serving the
+requested model, forwarding the protobuf bytes unchanged. Replica scheduling is set by
+`scheduling.mode`: `round_robin` (the default) spreads requests uniformly, while `lpt_packing`
+derives an adaptive memory-aware placement from live measurements, concentrating each model's
+traffic so worker-side batch coalescing fills (it requires workers running the `fifo` scheduler
+discipline). The supervisor configures the embedded gateway automatically from the node file; it
+autodiscovers which models each worker serves via `RepositoryIndex` and refreshes its routing
+table periodically. The gateway is pure Julia, in its own `ReactantServerGateway` package
 (`ReactantServerGateway.serve_gateway`); see `docs/src/manual/multi_gpu_gateway.md`.
 
 ## Shape convention (Julia-centric, zero-copy interop)
@@ -235,12 +234,9 @@ ReactantServerNode.supervise("docker/node.yaml")   # one worker per visible GPU 
 It synthesizes the worker list when the node file has none (`gpus: auto`) and spawns each worker
 as a subprocess pinned to its device via `CUDA_VISIBLE_DEVICES`. With more than one worker it
 also runs the embedded gateway, which routes by model name and load-balances replicated models;
-a single worker serves clients directly. Equivalently, run one worker per
-GPU yourself (each pointed at the same node file with a distinct `worker`) behind a standalone
-gateway: `using ReactantServerGateway; ReactantServerGateway.serve_gateway(gateway_path)` reads
-its own `gateway.yml` and serves the KServe V2 gRPC proxy. To call a server from Julia, use the
-Reactant-free `ReactantServerClient` package (`KServeModel` + `infer_sync`). See `docker/`
-for the container setup.
+a single worker serves clients directly. To call a server from Julia, use the Reactant-free
+`ReactantServerClient` package (`KServeModel` + `infer_sync`). See `docker/` for the container
+setup and `docs/` for the Getting Started and Scaling guides.
 
 A bundle is a directory containing `manifest.yaml`, `model.mlir` (a serialized StableHLO
 portable artifact), `weights.safetensors`, and an optional `model.jl`. Bundles are produced by
