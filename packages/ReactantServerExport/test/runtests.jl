@@ -107,8 +107,8 @@ _load_manifest(dir) = ReactantServer.parse_manifest(
     end
 
     if HAS_TORCH
-        const np = pyimport("numpy")
-        const torch = pyimport("torch")
+        np = pyimport("numpy")
+        torch = pyimport("torch")
 
         # PyTorch (row-major) tensor -> Julia col-major Array with reversed shape (same bytes).
         function torch_to_julia(py_tensor)
