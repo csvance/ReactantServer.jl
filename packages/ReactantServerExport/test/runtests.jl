@@ -42,6 +42,10 @@ if !SKIP_PYTORCH
         run(
             `python -m pip install --index-url https://download.pytorch.org/whl/cpu --no-deps --force-reinstall "torch==$(torch_version)"`,
         )
+        # The CUDA torch resolve also pulled in triton, whose bundled libtriton.so statically links
+        # an LLVM that collides with Reactant/XLA and segfaults when torch's export path imports it.
+        # The CPU build does not need triton, so remove it (pip exits 0 if it is already absent).
+        run(`python -m pip uninstall -y triton pytorch-triton`)
     end
 end
 
