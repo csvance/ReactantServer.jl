@@ -47,12 +47,20 @@ share a GPU and one model executes at a time.
 
 ## Quick start
 
-Serve a directory of model bundles from one container (scales to all visible GPUs):
+The image is built locally (it is not published to a registry), so build it once and then serve a
+directory of model bundles from the container (it scales to all visible GPUs):
 
 ```
+git submodule update --init --recursive   # fetch the vendored lib/ forks the build needs
+make image                                 # build reactantserver:latest (or: docker compose build)
+
 docker run --gpus all --ipc=host -p 8001:8001 -p 8002:8002 \
   -v /path/to/bundles:/var/lib/reactantserver/models:ro reactantserver
 ```
+
+The build is large and the first server startup is slow, since every model compiles before the
+gRPC plane accepts traffic. See [Docker Deployment](docs/src/manual/docker.md) for the
+`docker compose` workflow and configuration.
 
 Or from pure Julia:
 
