@@ -32,7 +32,8 @@ jobs:
       gateway: ${{ steps.filter.outputs.gateway }}
       server: ${{ steps.filter.outputs.server }}
       node: ${{ steps.filter.outputs.node }}
-      export: ${{ steps.filter.outputs.export }}
+      export_lux: ${{ steps.filter.outputs.export_lux }}
+      export_pytorch: ${{ steps.filter.outputs.export_pytorch }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
@@ -85,7 +86,8 @@ jobs:
             node:
               - *common
               - 'packages/ReactantServerNode/**'
-            export:
+            # The Lux round-trip runs whenever anything ReactantServerExport depends on changes.
+            export_lux:
               - *common
               - 'packages/ReactantServerExport/**'
               - 'packages/ReactantServer/**'
@@ -97,6 +99,16 @@ jobs:
               - 'lib/HTTP.jl/**'
               - 'lib/Prometheus.jl'
               - 'lib/Prometheus.jl/**'
+            # The PyTorch round-trip is heavy (it provisions torch/jax/tensorflow via conda), so it
+            # runs only when the PyTorch-specific surface changes: the extension, its conda pins, the
+            # test runner, or the workflow files themselves. It deliberately omits the `common`
+            # anchor so an unrelated Core/Manifest change does not pay the torch cost.
+            export_pytorch:
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/_test.yml'
+              - 'packages/ReactantServerExport/ext/PyTorchExportExt.jl'
+              - 'packages/ReactantServerExport/CondaPkg.toml'
+              - 'packages/ReactantServerExport/test/runtests.jl'
 
   core:
     needs: changes
@@ -133,15 +145,50 @@ jobs:
     with:
       command: "julia --color=yes --project=packages/ReactantServerNode -e 'using Pkg; Pkg.test(; julia_args=[\"--threads=auto,1\"])'"
 
-  export:
+  # Lux-only round-trip: REACTANTSERVER_SKIP_PYTORCH=true keeps runtests.jl from loading PythonCall,
+  # so no conda env is provisioned and the job stays fast. The standalone test/ project is not a
+  # Pkg.test target, so it is instantiated explicitly before the runner script.
+  export-lux:
     needs: changes
-    if: ${{ needs.changes.outputs.export == 'true' }}
+    if: ${{ needs.changes.outputs.export_lux == 'true' }}
     uses: ./.github/workflows/_test.yml
     with:
-      command: "julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
+      command: "julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()' && REACTANTSERVER_SKIP_PYTORCH=true julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl"
+
+  # Full round-trip including the PyTorch export path. This is a standalone job (not the reusable
+  # workflow) because it needs an extra cache step for the CondaPkg-provisioned Python environment,
+  # which julia-actions/cache does not cover. Gated on the narrow export_pytorch filter.
+  export-pytorch:
+    needs: changes
+    if: ${{ needs.changes.outputs.export_pytorch == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: write   # julia-actions/cache prunes its old caches
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+      - uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32 # v3.0.2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@a45e8fa8be21c18a06b7177052533149e61e9b38 # v3.1.0
+      # Cache the CondaPkg-provisioned Python env (torch/jax/tensorflow); keyed on the conda pins and
+      # the test Manifest so a torch bump or dep change invalidates it.
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: packages/ReactantServerExport/test/.CondaPkg
+          key: condapkg-${{ runner.os }}-${{ hashFiles('packages/ReactantServerExport/CondaPkg.toml', 'packages/ReactantServerExport/test/Manifest.toml') }}
+          restore-keys: |
+            condapkg-${{ runner.os }}-
+      - name: Run PyTorch export round-trip
+        run: |
+          julia --color=yes --project=packages/ReactantServerExport/test -e 'using Pkg; Pkg.instantiate()'
+          julia --color=yes --project=packages/ReactantServerExport/test packages/ReactantServerExport/test/runtests.jl
 
   ci-ok:
-    needs: [core, client, gateway, server, node, export]
+    needs: [core, client, gateway, server, node, export-lux, export-pytorch]
     if: always()
     runs-on: ubuntu-latest
     steps:

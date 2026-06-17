@@ -12,16 +12,31 @@ using Random
 # ahead of Reactant's MLIR/LLVM to avoid a static-initialization SIGSEGV. The PyTorch export
 # methods live in the PythonCall-triggered extension, so loading PythonCall here also enables
 # them once ReactantServerExport is loaded below.
-using PythonCall
-const HAS_TORCH = try
-    pyimport("torch")
-    pyimport("torch.export")
-    pyimport("torchax.export")
-    pyimport("numpy")
-    true
-catch err
-    @info "Skipping PyTorch export tests: required Python module not importable" error = err
+#
+# Set REACTANTSERVER_SKIP_PYTORCH=true to skip the PyTorch path without loading PythonCall at all,
+# so no conda environment is provisioned. The `export-lux` CI job sets this for a fast Lux-only
+# run; `export-pytorch` leaves it unset to exercise the full round-trip. Default (unset) keeps the
+# original behavior: load PythonCall and run the torch tests when torch is importable.
+const SKIP_PYTORCH = get(ENV, "REACTANTSERVER_SKIP_PYTORCH", "false") == "true"
+
+# Keep the load in its own top-level statement (via @eval, since `using` cannot be nested inside an
+# expression) so PythonCall's methods are visible in the next world age when we probe below.
+SKIP_PYTORCH || @eval using PythonCall
+
+const HAS_TORCH = if SKIP_PYTORCH
+    @info "Skipping PyTorch export tests: REACTANTSERVER_SKIP_PYTORCH is set"
     false
+else
+    try
+        pyimport("torch")
+        pyimport("torch.export")
+        pyimport("torchax.export")
+        pyimport("numpy")
+        true
+    catch err
+        @info "Skipping PyTorch export tests: required Python module not importable" error = err
+        false
+    end
 end
 
 using ReactantServerExport
