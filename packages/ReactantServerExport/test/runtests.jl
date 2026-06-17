@@ -20,8 +20,20 @@ using Random
 const SKIP_PYTORCH = get(ENV, "REACTANTSERVER_SKIP_PYTORCH", "false") == "true"
 
 # Keep the load in its own top-level statement (via @eval, since `using` cannot be nested inside an
-# expression) so PythonCall's methods are visible in the next world age when we probe below.
-SKIP_PYTORCH || @eval using PythonCall
+# expression) so the methods are visible in the next world age when we probe below. Loading
+# PythonCall here also provisions the CondaPkg environment declared in CondaPkg.toml.
+SKIP_PYTORCH || @eval using PythonCall, CondaPkg
+
+# Force the CPU build of PyTorch. PyPI's default Linux torch wheel bundles CUDA libraries that
+# segfault when they collide with JAX/XLA on a CPU-only host, and conda cannot select the `+cpu`
+# wheel, so install it with pip into the CondaPkg environment after it is provisioned (this mirrors
+# the workaround used in Reactant.jl). The round-trip runs entirely on CPU, so the CPU build is the
+# correct one regardless of the host.
+if !SKIP_PYTORCH
+    CondaPkg.withenv() do
+        run(`python -m pip install --force-reinstall --no-deps --index-url https://download.pytorch.org/whl/cpu torch`)
+    end
+end
 
 const HAS_TORCH = if SKIP_PYTORCH
     @info "Skipping PyTorch export tests: REACTANTSERVER_SKIP_PYTORCH is set"
