@@ -84,6 +84,20 @@ end
     @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: huge\n" * eps)
 end
 
+@testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
+                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill",
+                           Dict{String,GW.GatewayModelConfig}())
+    pool = GW.ClientPool(cfg)
+    # Default (wait_seconds = 0) fails fast when a worker is unreachable.
+    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
+    # A bounded wait polls, then still errors if the worker never comes up.
+    t0 = time()
+    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0.3,
+                                                                     poll_interval = 0.05)
+    @test time() - t0 >= 0.25
+end
+
 @testset "compute_assignment: memory dimension steers placement" begin
     W = ["w0", "w1"]
     GB = 1.0e9

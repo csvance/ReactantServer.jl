@@ -101,6 +101,12 @@ function gateway_spec(workspace_root::AbstractString;
         endpoints === nothing || push!(pairs, "REACTANT_GATEWAY_WORKERS" => join(endpoints, ","))
         metrics_endpoints === nothing || isempty(metrics_endpoints) ||
             push!(pairs, "REACTANT_GATEWAY_WORKER_METRICS" => join(metrics_endpoints, ","))
+        # The supervisor co-launches the workers, which compile every model before answering. Under
+        # lpt_packing the gateway must wait for all of them before its startup checks pass, so make
+        # the embedded gateway wait indefinitely by default (the worker subprocesses are this
+        # supervisor's responsibility) rather than fail fast. An explicit env value wins.
+        haskey(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS") ||
+            push!(pairs, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS" => "inf")
         isempty(pairs) || (cmd = addenv(cmd, pairs...))
     end
     return ChildSpec("gateway", cmd, Float64(grace_seconds))

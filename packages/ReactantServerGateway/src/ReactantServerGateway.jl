@@ -78,6 +78,16 @@ end
 const _H2_INITIAL_WINDOW_BYTES = 32 * 1024 * 1024     # per-stream receive window
 const _H2_CONNECTION_WINDOW_BYTES = 32 * 1024 * 1024  # connection-level receive window
 
+# How long lpt_packing startup waits for all workers to come up over the control plane before
+# serving (REACTANT_GATEWAY_STARTUP_WAIT_SECONDS). Default 0 fails fast; "inf"/"forever"/"-1" waits
+# indefinitely. The node supervisor sets this to wait for the workers it co-launches (workers
+# compile before they answer), so the embedded gateway gates on them instead of crash-looping.
+function _startup_wait_seconds()
+    s = lowercase(strip(get(ENV, "REACTANT_GATEWAY_STARTUP_WAIT_SECONDS", "0")))
+    s in ("inf", "forever", "-1") && return Inf
+    return something(tryparse(Float64, s), 0.0)
+end
+
 """
     serve_gateway(gateway_path=nothing; blocking=true) -> nothing | RunningGateway
 
@@ -104,7 +114,7 @@ function serve_gateway(gateway_path::Union{AbstractString,Nothing} = nothing; bl
     # packing rather than waiting a prober tick.
     packing = nothing
     if cfg.scheduling_mode == "lpt_packing"
-        verify_lpt_packing_preconditions!(pool)
+        verify_lpt_packing_preconditions!(pool; wait_seconds = _startup_wait_seconds())
         packing = LptPackingState(cfg)
         @info "gateway scheduling: lpt_packing" rebalance_compute_seconds = cfg.rebalance_compute_seconds min_rebalance_seconds = cfg.min_rebalance_seconds default_replicas = (cfg.default_replicas == REPLICAS_ALL ? "all" : cfg.default_replicas) routing_policy = cfg.routing_policy
     end

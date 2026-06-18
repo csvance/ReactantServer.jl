@@ -117,13 +117,19 @@ idle between dispatches. The `least_outstanding` policy instead routes to the GP
 total in-flight work, which helps when replicas share GPUs with other models. A single-replica
 model is the degenerate case: all its requests go to its one GPU.
 
-`lpt_packing` has two preconditions, verified as a hard failure at gateway startup: every
-worker must run the `fifo` scheduler discipline (placement decisions move to the gateway, so
-workers should not re-order against it; see `scheduler.discipline` in
-[Node Configuration](node_config.md)), and every worker must serve the identical model
-set. Runtime drift degrades gracefully: a model temporarily missing from some workers is
-routed uniformly over its actual replicas with a warning until the fleet converges. A worker that
-drops out is excluded from placement, its traffic failing over to the remaining replicas.
+`lpt_packing` has two preconditions, verified at gateway startup: every worker must run the `fifo`
+scheduler discipline (placement decisions move to the gateway, so workers should not re-order
+against it; see `scheduler.discipline` in [Node Configuration](node_config.md)), and every worker
+must serve the identical model set. Because a worker compiles and warms up every model before its
+control plane answers, the workers are usually not up when the gateway starts, so the gateway waits
+for all of them before serving rather than failing, logging which workers are still pending. Under
+the node supervisor (the embedded gateway) this wait is enabled automatically; for a standalone
+gateway set `REACTANT_GATEWAY_STARTUP_WAIT_SECONDS` (a number of seconds, or `inf` to wait
+indefinitely; the default `0` fails fast). Once all workers are up, a wrong discipline or differing
+model set is a hard error. Runtime drift after startup degrades gracefully: a model temporarily
+missing from some workers is routed uniformly over its actual replicas with a warning until the
+fleet converges, and a worker that drops out is excluded from placement, its traffic failing over
+to the remaining replicas.
 
 The placement is observable: `gateway_model_replicas` reports each model's replica count,
 `gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports

@@ -471,19 +471,39 @@ function _release_route!(counters)
 end
 
 """
-    verify_lpt_packing_preconditions!(pool) -> nothing
+    verify_lpt_packing_preconditions!(pool; wait_seconds=0, poll_interval=5.0) -> nothing
 
-LPT-packing mode's hard startup checks: every configured worker must be reachable over the control
-plane, report FIFO scheduling discipline, and serve an identical model set (load-all). Any
-violation raises with the offending worker named.
+LPT-packing mode's startup checks: every configured worker must be reachable over the control
+plane, report FIFO scheduling discipline, and serve an identical model set (load-all).
+
+Reachability is gated rather than asserted: a worker compiles and warms up every model before its
+control plane answers, so at startup the workers are usually not up yet. With `wait_seconds > 0`
+(or `Inf` to wait indefinitely) the check polls every `poll_interval` seconds until all workers
+answer, logging which are still pending; with `wait_seconds <= 0` (the default) it checks once and
+fails fast. The supervisor sets this to wait for the workers it co-launches (see `gateway_spec`).
+Once all workers are reachable, FIFO discipline and identical model sets are hard requirements and
+a violation raises with the offending worker named.
 """
-function verify_lpt_packing_preconditions!(pool::ClientPool)
+function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=0,
+                                           poll_interval::Real=5.0)
+    clients = all_clients(pool)
+    forever = isinf(wait_seconds)
+    deadline = (forever || wait_seconds <= 0) ? nothing : time() + Float64(wait_seconds)
     statuses = Dict{String,Any}()
-    for wc in all_clients(pool)
-        resp = fetch_control_status(wc)
-        resp === nothing &&
-            error("lpt_packing scheduling: worker $(wc.url) is unreachable over the control plane; all workers must be up at startup")
-        statuses[wc.url] = resp
+    while true
+        statuses = Dict{String,Any}()
+        pending = String[]
+        for wc in clients
+            resp = fetch_control_status(wc)
+            resp === nothing ? push!(pending, wc.url) : (statuses[wc.url] = resp)
+        end
+        isempty(pending) && break
+        if !forever && (wait_seconds <= 0 || time() >= deadline)
+            suffix = wait_seconds <= 0 ? "" : " after $(round(Int, wait_seconds))s"
+            error("lpt_packing scheduling: worker(s) $(sort(pending)) unreachable over the control plane$(suffix); all workers must be up (set REACTANT_GATEWAY_STARTUP_WAIT_SECONDS to wait for slow-starting workers, or 'inf' to wait indefinitely)")
+        end
+        @info "lpt_packing: waiting for all workers before serving (workers compile before they answer the control plane)" ready = sort(collect(keys(statuses))) pending = sort(pending)
+        sleep(poll_interval)
     end
     for (url, resp) in statuses
         resp.discipline == "fifo" ||
