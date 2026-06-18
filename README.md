@@ -91,7 +91,7 @@ and full StableHLO-signature validation of manifests. See
 
 ## Repository layout
 
-A Julia 1.11+ workspace of five packages under `packages/`, split so that talking to a server never
+A Julia 1.12+ workspace of five packages under `packages/`, split so that talking to a server never
 pulls in the heavy Reactant/XLA stack:
 
 - **`ReactantServerCore`** — shared, Reactant-free substrate: dtypes, the KServe V2 protobuf

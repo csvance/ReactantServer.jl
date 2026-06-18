@@ -16,7 +16,7 @@
 # Build (from the repo root):
 #   docker build -f docker/Dockerfile -t reactantserver .   # or: make image
 
-FROM docker.io/library/julia:1.12.5-trixie
+FROM docker.io/library/julia:1.12.6-trixie
 
 ENV JULIA_DEPOT_PATH=/opt/julia-depot \
     JULIA_PROJECT=/opt/reactantserver \
