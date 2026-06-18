@@ -181,15 +181,30 @@ end
 
 # ---- metrics scrape (via curl; no extra Julia deps) -------------------------------------------
 
-function scrape_metrics()
+# Sum a Prometheus counter across all of its label series (one per worker/gpu). The value is the
+# last whitespace-separated token of each `name{labels} value` / `name value` line.
+function _sum_counter(txt::AbstractString, name::AbstractString)
+    total = 0.0
+    for line in split(txt, '\n')
+        startswith(line, name) || continue
+        c = length(line) > length(name) ? line[length(name) + 1] : ' '
+        (c == '{' || c == ' ') || continue          # exact metric, not a longer-named one
+        v = tryparse(Float64, String(last(split(line))))
+        v === nothing || (total += v)
+    end
+    return total
+end
+
+# Fleet weight-cache load/evict totals (summed across workers), or nothing if the scrape failed.
+# Climbing evicts under steady load means the model set does not fit resident and the workers are
+# thrashing weights (host->device reloads = CPU), which the loadgen surfaces inline.
+function scrape_cache_counters()
     try
         txt = read(`curl -fsS --max-time 3 $METRICS_URL`, String)
-        for line in split(txt, '\n')
-            (startswith(line, "gateway_requests_total") || startswith(line, "gateway_worker_ready")) &&
-                println("    metric  ", line)
-        end
+        return (round(Int, _sum_counter(txt, "worker_weight_loads_total")),
+                round(Int, _sum_counter(txt, "worker_weight_evicts_total")))
     catch err
-        println("    metrics scrape failed: ", sprint(showerror, err))
+        return nothing
     end
 end
 
@@ -223,6 +238,7 @@ function main()
     reporter = Threads.@spawn begin
         last_ok = 0
         last_t = time()
+        last_loads = 0; last_evicts = 0
         err_shown = false
         while time() < deadline
             sleep(REPORT_SEC)
@@ -230,6 +246,17 @@ function main()
             ok = N_OK[]; err = N_ERR[]
             d_ok = ok - last_ok
             rps = d_ok / max(now - last_t, 1e-6)
+            # Weight-cache load/evict totals across workers, with this window's delta. A rising evict
+            # rate is the worker-CPU "thrash" signal (the model set does not fit resident).
+            cache = scrape_cache_counters()
+            cache_str = if cache === nothing
+                "cache=?"
+            else
+                loads, evicts = cache
+                s = "loads=$(loads)(+$(loads - last_loads)) evicts=$(evicts)(+$(evicts - last_evicts))"
+                last_loads = loads; last_evicts = evicts
+                s
+            end
             # Distribution over the requests completed THIS window: drain the samples (so a one-time
             # startup-compile spike only shows in its own window, never pinning later windows) and
             # report min / median / p95 / max plus the mean. `ok`/`err` stay cumulative totals.
@@ -241,12 +268,12 @@ function main()
             ms(x) = round(x / 1e6, digits = 2)
             stamp = round(Int, now - (deadline - DURATION))
             if n == 0
-                println("[t+$(stamp)s] ok=$ok err=$err rps=$(round(rps, digits=1)) (no completions this window)")
+                println("[t+$(stamp)s] ok=$ok err=$err rps=$(round(rps, digits=1)) $cache_str (no completions this window)")
             else
                 mean_ms = ms(sum(window) / n)
                 println("[t+$(stamp)s] ok=$ok err=$err rps=$(round(rps, digits=1)) ",
                         "mean=$(mean_ms)ms min=$(ms(window[1]))ms p50=$(ms(_quantile_sorted(window, 0.5)))ms ",
-                        "p95=$(ms(_quantile_sorted(window, 0.95)))ms max=$(ms(window[n]))ms")
+                        "p95=$(ms(_quantile_sorted(window, 0.95)))ms max=$(ms(window[n]))ms $cache_str")
             end
             # Surface the failure cause as soon as errors appear instead of only at soak end.
             if !err_shown && err > 0
@@ -254,7 +281,6 @@ function main()
                 println("    first error: ", sample)
                 err_shown = true
             end
-            scrape_metrics()
             last_ok = ok; last_t = now
         end
     end

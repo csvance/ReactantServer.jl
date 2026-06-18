@@ -4,9 +4,10 @@
 # independently. All three are raw Vector{UInt8} in and out; only the small routing headers are
 # decoded (see headers.jl). Mirrors the Go gateway's internal/grpcserver.
 
-# Per-request state threaded through gRPCServer's context payload.
-struct GatewayState
-    pool::ClientPool
+# Per-request state threaded through gRPCServer's context payload. Parametric on the pool type so
+# the request hot path (`st.pool` -> `get_clients` -> `wc.infer`) stays type-stable.
+struct GatewayState{P<:ClientPool}
+    pool::P
     routes::DiscoveredRoutes
     gate::RegisterGate
     metrics::GatewayMetrics
@@ -36,7 +37,6 @@ function _post_infer(st::GatewayState, url, model, id, body)
     try
         resp = invoke_infer(wc, body)
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)
-        @info "infer: ok" model worker = url request_id = id req_bytes = length(body) resp_bytes = length(resp)
         return resp, STATUS_OK, nothing
     catch e
         observe_worker!(st.metrics, "ModelInfer", url, time() - t0)

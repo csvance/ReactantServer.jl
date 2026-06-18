@@ -30,6 +30,12 @@
 # The weights are exported as metrics; request routing uses outstanding-batch counts, not weights.
 const Placement = Vector{Tuple{String,Float64}}
 
+# Watchdog ceiling for one control-status poll. The gateway's clients share one libcurl multi
+# handle with a 16-slot request semaphore (GRPC_MAX_STREAMS); if its driving stalls, in-flight
+# calls never release their slot and new calls block forever, so every poll is bounded and a worker
+# that exceeds this is treated as not-polled.
+const POLL_TIMEOUT_SECONDS = 8.0
+
 """
     compute_assignment(u, workers, prev; mem=Dict(), mem_cap=Dict(),
                        replicas=Dict(), default_replicas=1, hysteresis=0.1)
@@ -55,12 +61,24 @@ longer present are ignored in `prev`. Cold models (no traffic yet) carry `u[m] =
 like any other, packed by memory; models absent from `u` entirely are not placed and the caller
 routes them uniformly. Load never changes a model's `k`; replica count is fixed by configuration.
 """
+# Optional per-repack diagnostics filled by `compute_assignment` (single-replica hysteresis only).
+# `held` counts models whose lowest-pressure worker differed from their current one but that stayed
+# put because the improvement was under the hysteresis threshold. `max_improvement` is the largest
+# available relative pressure reduction across single-replica models (taken or not), so a caller can
+# see where the fleet sits relative to the threshold even when nothing moved.
+mutable struct RepackStats
+    held::Int
+    max_improvement::Float64
+end
+RepackStats() = RepackStats(0, 0.0)
+
 function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
                             prev::Dict{String,Placement};
                             mem::Dict{String,Float64}=Dict{String,Float64}(),
                             mem_cap::Dict{String,Float64}=Dict{String,Float64}(),
                             replicas::Dict{String,Int}=Dict{String,Int}(),
-                            default_replicas::Int=1, hysteresis::Float64=0.1)
+                            default_replicas::Int=1, hysteresis::Float64=0.1,
+                            stats::Union{Nothing,RepackStats}=nothing)
     out = Dict{String,Placement}()
     isempty(workers) && return out
     cload = Dict{String,Float64}(w => 0.0 for w in workers)   # compute, normalized (capacity 1.0)
@@ -84,7 +102,16 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
             # model's resulting pressure by more than the threshold.
             if prev_pl !== nothing && length(prev_pl) == 1 && haskey(cload, prev_pl[1][1])
                 wp = prev_pl[1][1]
-                score_after(wp, um, wm) <= score_after(best, um, wm) * (1 + hysteresis) && (chosen = wp)
+                bestscore = score_after(best, um, wm)
+                prevscore = score_after(wp, um, wm)
+                if stats !== nothing
+                    impr = bestscore > 0 ? (prevscore / bestscore - 1.0) : 0.0
+                    impr > stats.max_improvement && (stats.max_improvement = impr)
+                end
+                if prevscore <= bestscore * (1 + hysteresis)
+                    chosen = wp
+                    stats !== nothing && best != wp && (stats.held += 1)
+                end
             end
             out[m] = [(chosen, 1.0)]
             cload[chosen] += um
@@ -205,8 +232,16 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
         wc = get_clients(pool, url)
         wc === nothing && continue
         @async begin
-            resp = fetch_control_status(wc)
-            resp === nothing && return
+            # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
+            # it route discovery and /readyz). A worker that does not answer is simply skipped this
+            # round, as if not ready. A hung call (timed out, not a fast refuse) means a poisoned
+            # connection; drop it so the next poll reconnects fresh.
+            resp, to = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
+                                "ModelControlStatus poll", url)
+            if resp === nothing
+                to && reset_clients!(wc)
+                return
+            end
             lock(lk) do
                 push!(polled, url)
                 mem_cap[url] = Float64(resp.weight_cache_max_bytes)
@@ -258,6 +293,10 @@ end
 # gets a uniform placement over the workers that do serve it, with a warning.
 function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothing})
     now = time()
+    # Elapsed since the last repack, for the repack log: wall time and the fleet GPU-seconds that
+    # accumulated (the compute that triggered this repack). Captured before they are reset below.
+    wall_elapsed = s.last_rebalance == 0.0 ? 0.0 : now - s.last_rebalance
+    compute_elapsed = s.compute_accum
     dt = s.last_rebalance == 0.0 ? s.rate_halflife : max(now - s.last_rebalance, 1e-3)
     s.last_rebalance = now
 
@@ -299,16 +338,27 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     end
 
     prev = @atomic s.assignment
+    stats = RepackStats()
     next = compute_assignment(full, sort(poll.polled), prev;
                               mem=poll.mem, mem_cap=poll.mem_cap,
                               replicas=s.model_replicas, default_replicas=s.default_replicas,
-                              hysteresis=s.hysteresis)
+                              hysteresis=s.hysteresis, stats=stats)
     merge!(next, drifted)
     @atomic s.assignment = next
     _swap_outstanding!(s, next)
 
     s.compute_accum = 0.0
     s.last_fleet_compute = poll.fleet_compute
+
+    # Count models whose worker set changed from the previous assignment (a model new this repack is
+    # an initial placement, not a move, so it is not counted).
+    moved = 0
+    for (m, placement) in next
+        prevpl = get(prev, m, nothing)
+        prevpl === nothing && continue
+        Set(first.(placement)) == Set(first.(prevpl)) || (moved += 1)
+    end
+    @info "lpt_packing: repack" models = length(next) moved = moved held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = s.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
 
     # Memory oversubscription warning: when a worker's assigned weight footprint exceeds its
     # on-demand budget the packing is infeasible (total weights outgrew the fleet); the worker's
@@ -471,19 +521,67 @@ function _release_route!(counters)
 end
 
 """
-    verify_lpt_packing_preconditions!(pool) -> nothing
+    verify_lpt_packing_preconditions!(pool; wait_seconds=0, poll_interval=10.0,
+                                      call_timeout=8.0, wedge_rounds=3) -> nothing
 
-LPT-packing mode's hard startup checks: every configured worker must be reachable over the control
-plane, report FIFO scheduling discipline, and serve an identical model set (load-all). Any
-violation raises with the offending worker named.
+LPT-packing mode's startup checks: every configured worker must be reachable over the control
+plane, report FIFO scheduling discipline, and serve an identical model set (load-all).
+
+Reachability is gated rather than asserted: a worker compiles and warms up every model before its
+control plane answers, so at startup the workers are usually not up yet. With `wait_seconds > 0`
+(or `Inf` to wait indefinitely) the check polls every `poll_interval` seconds until all workers
+answer, logging which are still pending; with `wait_seconds <= 0` (the default) it checks once and
+fails fast. The supervisor sets this to wait for the workers it co-launches (see `gateway_spec`).
+Once all workers are reachable, FIFO discipline and identical model sets are hard requirements and
+a violation raises with the offending worker named.
+
+Every poll is watchdog-bounded (`call_timeout`): the gateway's clients share one libcurl multi
+handle whose request semaphore caps in-flight requests at GRPC_MAX_STREAMS (16). After the burst of
+failed connects during warmup the handle's socket/timer driving can stall, so in-flight requests
+never complete, never return their semaphore slot, and every new call blocks at acquire forever (the
+"wedge"). A worker that is merely down refuses fast and releases its slot; but if every worker's
+call exceeds the watchdog for `wedge_rounds` consecutive rounds (the wedge signature), the process
+exits so the supervisor restarts the gateway with a fresh handle (16 free slots), which recovers.
 """
-function verify_lpt_packing_preconditions!(pool::ClientPool)
+function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=0,
+                                           poll_interval::Real=10.0, call_timeout::Real=8.0,
+                                           wedge_rounds::Integer=3)
+    clients = all_clients(pool)
+    forever = isinf(wait_seconds)
+    deadline = (forever || wait_seconds <= 0) ? nothing : time() + Float64(wait_seconds)
     statuses = Dict{String,Any}()
-    for wc in all_clients(pool)
-        resp = fetch_control_status(wc)
-        resp === nothing &&
-            error("lpt_packing scheduling: worker $(wc.url) is unreachable over the control plane; all workers must be up at startup")
-        statuses[wc.url] = resp
+    wedged_streak = 0
+    while true
+        statuses = Dict{String,Any}()
+        pending = String[]
+        timed_out = 0
+        for wc in clients
+            resp, to = _bounded(() -> fetch_control_status(wc), call_timeout, nothing,
+                                "ModelControlStatus poll", wc.url)
+            if resp === nothing
+                push!(pending, wc.url)
+                # A hung call (not a fast refuse) means the worker was caught mid-stall and its
+                # connection is poisoned; drop it so the next poll reconnects fresh.
+                to && (timed_out += 1; reset_clients!(wc))
+            else
+                statuses[wc.url] = resp
+            end
+        end
+        isempty(pending) && break
+        # Wedge signature: every worker's call exceeded the watchdog (the client stack stopped being
+        # driven, not just refused). A fresh process recovers, so exit for a supervisor restart
+        # rather than spin forever on a dead handle.
+        wedged_streak = timed_out == length(clients) ? wedged_streak + 1 : 0
+        if wedge_rounds > 0 && wedged_streak >= wedge_rounds
+            @error "lpt_packing: control-plane calls timed out for $(wedged_streak) consecutive rounds; the gRPC client stack is wedged. Exiting so the supervisor restarts the gateway with a fresh stack." rounds = wedged_streak
+            exit(1)
+        end
+        if !forever && (wait_seconds <= 0 || time() >= deadline)
+            suffix = wait_seconds <= 0 ? "" : " after $(round(Int, wait_seconds))s"
+            error("lpt_packing scheduling: worker(s) $(sort(pending)) unreachable over the control plane$(suffix); all workers must be up (set REACTANT_GATEWAY_STARTUP_WAIT_SECONDS to wait for slow-starting workers, or 'inf' to wait indefinitely)")
+        end
+        @info "lpt_packing: waiting for all workers before serving (workers compile before they answer the control plane)" ready = sort(collect(keys(statuses))) pending = sort(pending)
+        sleep(poll_interval)
     end
     for (url, resp) in statuses
         resp.discipline == "fifo" ||

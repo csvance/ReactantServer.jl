@@ -14,49 +14,95 @@ const STATUS_INVALID = "InvalidArgument"
 const STATUS_FAILED_PRE = "FailedPrecondition"
 const STATUS_INTERNAL = "Internal"
 
-struct WorkerClients
+# A worker's gRPC clients, all sharing one per-worker libcurl multi handle (`grpc`). Each worker
+# gets its own gRPCCURL: HTTP/2 multiplexing only reuses connections within one host:port, so
+# workers share nothing, and a separate handle gives each its own GRPC_MAX_STREAMS (16) in-flight
+# budget and request semaphore, isolating a slow or wedged worker to its own slots. The struct is
+# parametric so every field keeps its concrete client type (the request path forwards through
+# `infer` with no dynamic dispatch); the type parameters are inferred at construction.
+struct WorkerClients{G,I,SR,SU,RD,RI,CS}
     url::String
-    infer::Any
-    shm_register::Any
-    shm_unregister::Any
-    ready::Any
-    repo_index::Any
-    control_status::Any    # ControlService/ModelControlStatus (lpt_packing cost polling + preconditions)
+    grpc::G
+    infer::I
+    shm_register::SR
+    shm_unregister::SU
+    ready::RD
+    repo_index::RI
+    control_status::CS    # ControlService/ModelControlStatus (lpt_packing cost polling + preconditions)
 end
 
-struct ClientPool
+struct ClientPool{W<:WorkerClients}
     order::Vector{String}
-    clients::Dict{String,WorkerClients}
+    clients::Dict{String,W}
+end
+
+# Build one worker's clients over a freshly-created multi handle.
+function _worker_clients(cfg::GatewayConfig, url::AbstractString)
+    host, port = _split_hostport(url)
+    # sticky=true pins each handle's libcurl driving tasks (socket watchers + timer) to the thread
+    # that owns them via @async rather than Threads.@spawn. The gateway terminates and forwards on
+    # one event-loop thread, so sticky scheduling keeps the per-request driving on that thread and
+    # avoids cross-thread handoff overhead on the hot path.
+    grpc = gRPCClient.gRPCCURL(; sticky = true)   # one running multi handle per worker
+    infer = GRPCInferenceService_ModelInfer_Client(host, port; grpc = grpc,
+        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
+        deadline = cfg.request_timeout_seconds,
+        max_send_message_length = cfg.max_send_msg_bytes,
+        max_recieve_message_length = cfg.max_recv_msg_bytes)
+    shm_reg = GRPCInferenceService_SystemSharedMemoryRegister_Client(host, port; grpc = grpc,
+        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
+        deadline = cfg.request_timeout_seconds)
+    shm_unreg = GRPCInferenceService_SystemSharedMemoryUnregister_Client(host, port; grpc = grpc,
+        TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
+        deadline = cfg.request_timeout_seconds)
+    ready = GRPCInferenceService_ServerReady_Client(host, port; grpc = grpc, deadline = 5)
+    repo_index = GRPCInferenceService_RepositoryIndex_Client(host, port; grpc = grpc, deadline = 5)
+    control_status = ControlService_ModelControlStatus_Client(host, port; grpc = grpc, deadline = 5)
+    return WorkerClients(url, grpc, infer, shm_reg, shm_unreg, ready, repo_index, control_status)
 end
 
 function ClientPool(cfg::GatewayConfig)
-    clients = Dict{String,WorkerClients}()
     order = String[]
     for url in cfg.workers
-        haskey(clients, url) && continue
-        host, port = _split_hostport(url)
-        infer = GRPCInferenceService_ModelInfer_Client(host, port;
-            TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-            deadline = cfg.request_timeout_seconds,
-            max_send_message_length = cfg.max_send_msg_bytes,
-            max_recieve_message_length = cfg.max_recv_msg_bytes)
-        shm_reg = GRPCInferenceService_SystemSharedMemoryRegister_Client(host, port;
-            TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-            deadline = cfg.request_timeout_seconds)
-        shm_unreg = GRPCInferenceService_SystemSharedMemoryUnregister_Client(host, port;
-            TRequest = Vector{UInt8}, TResponse = Vector{UInt8},
-            deadline = cfg.request_timeout_seconds)
-        ready = GRPCInferenceService_ServerReady_Client(host, port; deadline = 5)
-        repo_index = GRPCInferenceService_RepositoryIndex_Client(host, port; deadline = 5)
-        control_status = ControlService_ModelControlStatus_Client(host, port; deadline = 5)
-        clients[url] = WorkerClients(url, infer, shm_reg, shm_unreg, ready, repo_index, control_status)
-        push!(order, url)
+        url in order || push!(order, url)
     end
+    wcs = map(url -> _worker_clients(cfg, url), order)   # Vector{W}, W concrete and identical
+    clients = Dict(wc.url => wc for wc in wcs)           # Dict{String,W}
     return ClientPool(order, clients)
 end
 
 get_clients(p::ClientPool, url::AbstractString) = get(p.clients, url, nothing)
-all_clients(p::ClientPool) = WorkerClients[p.clients[u] for u in p.order]
+all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
+
+# Reset a worker's multi handle in place: close it (dropping every pooled connection and aborting
+# any in-flight request on it) and re-open it. The worker's client stubs hold this handle by
+# identity, so they transparently use the fresh handle afterward. This recovers from a poisoned
+# connection: when a worker is caught mid-stall (TCP accepted but HTTP/2 not yet negotiated),
+# libcurl keeps the half-open connection pooled and every later request reuses (PIPEWAITs on) it
+# and hangs forever; only dropping the connection recovers it (the per-worker equivalent of a
+# process restart). Call this when a probe to the worker *hangs* (times out), not on a fast refuse.
+function reset_clients!(wc::WorkerClients)
+    try
+        gRPCClient.grpc_shutdown(wc.grpc)
+        gRPCClient.grpc_init(wc.grpc)
+    catch e
+        @warn "gateway: error resetting worker client handle" worker = wc.url exception = e
+    end
+    return nothing
+end
+
+# Shut down every worker's multi handle (closes connections, in-flight requests, the event-loop
+# timer and socket watchers). Called on gateway shutdown; finalizers would otherwise reclaim them.
+function close_pool!(p::ClientPool)
+    for wc in all_clients(p)
+        try
+            gRPCClient.grpc_shutdown(wc.grpc)
+        catch e
+            @warn "gateway: error shutting down worker client handle" worker = wc.url exception = e
+        end
+    end
+    return nothing
+end
 
 invoke_infer(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.infer, body)
 invoke_shm_register(wc::WorkerClients, body::Vector{UInt8}) = gRPCClient.grpc_sync_request(wc.shm_register, body)

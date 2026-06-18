@@ -117,13 +117,21 @@ idle between dispatches. The `least_outstanding` policy instead routes to the GP
 total in-flight work, which helps when replicas share GPUs with other models. A single-replica
 model is the degenerate case: all its requests go to its one GPU.
 
-`lpt_packing` has two preconditions, verified as a hard failure at gateway startup: every
-worker must run the `fifo` scheduler discipline (placement decisions move to the gateway, so
-workers should not re-order against it; see `scheduler.discipline` in
-[Node Configuration](node_config.md)), and every worker must serve the identical model
-set. Runtime drift degrades gracefully: a model temporarily missing from some workers is
-routed uniformly over its actual replicas with a warning until the fleet converges. A worker that
-drops out is excluded from placement, its traffic failing over to the remaining replicas.
+`lpt_packing` has two preconditions, verified at gateway startup: every worker must run the `fifo`
+scheduler discipline (placement decisions move to the gateway, so workers should not re-order
+against it; see `scheduler.discipline` in [Node Configuration](node_config.md)), and every worker
+must serve the identical model set. Because a worker compiles and warms up every model before its
+control plane answers, the workers are usually not up when the gateway starts, so the gateway waits
+for all of them before serving rather than failing, logging which workers are still pending. Under
+the node supervisor (the embedded gateway) this wait is enabled automatically; for a standalone
+gateway set `REACTANT_GATEWAY_STARTUP_WAIT_SECONDS` (a number of seconds, or `inf` to wait
+indefinitely; the default `0` fails fast). Each poll is watchdog-bounded, and if the gRPC client
+stack wedges during the long warmup (a known libcurl failure mode) the gateway exits so the
+supervisor restarts it with a fresh stack; this self-heals and you may see one such restart before
+it serves. Once all workers are up, a wrong discipline or differing model set is a hard error. Runtime drift after startup degrades gracefully: a model temporarily
+missing from some workers is routed uniformly over its actual replicas with a warning until the
+fleet converges, and a worker that drops out is excluded from placement, its traffic failing over
+to the remaining replicas.
 
 The placement is observable: `gateway_model_replicas` reports each model's replica count,
 `gateway_placement_weight` reports its per-worker weight, `gateway_replica_outstanding` reports
@@ -170,7 +178,15 @@ e.g. `REACTANT_GATEWAY_LOGGING_LEVEL=debug` or `REACTANT_GATEWAY_SCHEDULING_MODE
 - Under `lpt_packing`, the gateway polls the workers on every 10s probe round to refresh routing
   metadata and accumulate consumed compute, but recomputes the placement only once the fleet has
   consumed `scheduling.rebalance_compute_seconds` GPU-seconds (subject to the
-  `scheduling.min_rebalance_seconds` floor).
-- Every `ModelInfer` is logged with the model name, the client-supplied request id (KServe `id`
-  field), worker URL, request and response byte counts, worker latency, and gRPC status. Logs
-  contain no tensor data.
+  `scheduling.min_rebalance_seconds` floor). Each repack logs a `lpt_packing: repack` line with the
+  number of models placed, how many `moved` workers, how many were `held_by_hysteresis`, the largest
+  available `max_improvement` against the `hysteresis` threshold, and the `compute_seconds`/
+  `wall_seconds` since the last repack — useful for watching placement churn and the trigger cadence.
+- If a probe to a worker hangs (times out, rather than failing fast), the gateway drops and
+  recreates that worker's gRPC connection before the next attempt. This recovers from a half-open
+  connection (e.g. caught during a worker's brief silent-accept window at startup) that would
+  otherwise be reused and stall every later request to that worker — the per-worker equivalent of a
+  restart, without dropping HTTP/2 multiplexing for healthy workers.
+- Successful `ModelInfer` requests are not logged (to keep the hot path quiet); worker errors and a
+  model with no live replica are logged, and per-request latency and gRPC status are exported as
+  Prometheus metrics. Logs contain no tensor data.

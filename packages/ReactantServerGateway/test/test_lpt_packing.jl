@@ -5,6 +5,7 @@
 import gRPCServer
 import gRPCClient
 import HTTP
+import Sockets
 using ReactantServerCore.control   # bare message types for the included server stubs
 
 const AInf = ReactantServerCore.inference
@@ -82,6 +83,20 @@ end
     @test _load("scheduling:\n  models:\n    big:\n      replicas: all\n" * eps).models["big"].replicas == GW.REPLICAS_ALL
     @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: 0\n" * eps)
     @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: huge\n" * eps)
+end
+
+@testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
+    cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
+                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill",
+                           Dict{String,GW.GatewayModelConfig}())
+    pool = GW.ClientPool(cfg)
+    # Default (wait_seconds = 0) fails fast when a worker is unreachable.
+    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0)
+    # A bounded wait polls, then still errors if the worker never comes up.
+    t0 = time()
+    @test_throws ErrorException GW.verify_lpt_packing_preconditions!(pool; wait_seconds = 0.3,
+                                                                     poll_interval = 0.05)
+    @test time() - t0 >= 0.25
 end
 
 @testset "compute_assignment: memory dimension steers placement" begin
@@ -186,6 +201,46 @@ end
     a, _ = GW.route_replica(s, "m")
     b, _ = GW.route_replica(s, "m")
     @test a[1] != b[1]
+end
+
+@testset "reset_clients! recovers a poisoned (stalled) worker connection" begin
+    # A server that accepts TCP but never speaks gRPC/HTTP-2: the connection establishes then stalls
+    # on the HTTP/2 handshake, exactly like a worker caught in its brief silent-accept window at
+    # startup. With PIPEWAIT (which the client keeps for multiplexing), libcurl pools the half-open
+    # connection and every later request reuses (and hangs forever on) it; only dropping the
+    # connection recovers. The gateway calls reset_clients! when a probe to a worker hangs, the
+    # per-worker equivalent of a process restart. (The middle assertion documents the current
+    # gRPCClient connection-reuse behavior, to be hardened separately.)
+    srv = Sockets.listen(Sockets.localhost, 0)
+    port = Int(Sockets.getsockname(srv)[2])
+    acceptor = @async try
+        while isopen(srv)
+            Sockets.accept(srv)   # accept and hold; never respond
+        end
+    catch
+    end
+
+    grpc = gRPCClient.gRPCCURL(; sticky = true)
+    client = gRPCClient.gRPCServiceClient{Vector{UInt8},false,Vector{UInt8},false}(
+        "127.0.0.1", port, "/probe.Svc/Call"; grpc = grpc, deadline = 0.5)
+    bounded_call(cap) = begin
+        t = @async try
+            gRPCClient.grpc_sync_request(client, UInt8[0x00, 0x00, 0x00, 0x00, 0x00])
+        catch
+        end
+        timedwait(() -> istaskdone(t), cap)
+    end
+
+    @test bounded_call(3.0) == :ok          # first request times out at its 0.5s deadline, returns
+    @test bounded_call(3.0) == :timed_out   # second reuses the poisoned connection and hangs
+
+    wc = GW.WorkerClients("127.0.0.1:$port", grpc, client, client, client, client, client, client)
+    GW.reset_clients!(wc)                    # close + reopen the handle: drops the poisoned connection
+
+    @test bounded_call(3.0) == :ok          # fresh connection: times out at the deadline, no hang
+
+    gRPCClient.grpc_shutdown(grpc)
+    close(srv)
 end
 
 # --- Integration: mock workers serving inference + control ------------------------------------

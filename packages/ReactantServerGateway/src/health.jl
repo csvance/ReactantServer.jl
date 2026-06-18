@@ -102,6 +102,10 @@ function _check_once(p::HealthProber)
         set_worker_ready!(p.metrics, wc.url, results[i])
         any_ready |= results[i]
         any_responsive |= !timeouts[i]   # answered within the watchdog (ready or not)
+        # A hung probe (timed out, not a fast refuse) means the worker was caught mid-stall and its
+        # connection is poisoned; drop it so this round's discovery and the next probe reconnect
+        # fresh, instead of reusing (and hanging on) the half-open connection forever.
+        timeouts[i] && reset_clients!(wc)
     end
     set_ready!(p.admin, any_ready)
     p.ever_responsive |= any_responsive
