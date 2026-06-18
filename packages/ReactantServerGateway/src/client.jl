@@ -74,6 +74,23 @@ end
 get_clients(p::ClientPool, url::AbstractString) = get(p.clients, url, nothing)
 all_clients(p::ClientPool) = [p.clients[u] for u in p.order]
 
+# Reset a worker's multi handle in place: close it (dropping every pooled connection and aborting
+# any in-flight request on it) and re-open it. The worker's client stubs hold this handle by
+# identity, so they transparently use the fresh handle afterward. This recovers from a poisoned
+# connection: when a worker is caught mid-stall (TCP accepted but HTTP/2 not yet negotiated),
+# libcurl keeps the half-open connection pooled and every later request reuses (PIPEWAITs on) it
+# and hangs forever; only dropping the connection recovers it (the per-worker equivalent of a
+# process restart). Call this when a probe to the worker *hangs* (times out), not on a fast refuse.
+function reset_clients!(wc::WorkerClients)
+    try
+        gRPCClient.grpc_shutdown(wc.grpc)
+        gRPCClient.grpc_init(wc.grpc)
+    catch e
+        @warn "gateway: error resetting worker client handle" worker = wc.url exception = e
+    end
+    return nothing
+end
+
 # Shut down every worker's multi handle (closes connections, in-flight requests, the event-loop
 # timer and socket watchers). Called on gateway shutdown; finalizers would otherwise reclaim them.
 function close_pool!(p::ClientPool)

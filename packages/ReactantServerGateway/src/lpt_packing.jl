@@ -213,10 +213,14 @@ function _poll_workers(pool::ClientPool, ready_urls::Vector{String})
         @async begin
             # Watchdog-bounded: a wedged client stack would otherwise hang the prober tick (and with
             # it route discovery and /readyz). A worker that does not answer is simply skipped this
-            # round, as if not ready.
-            resp, _ = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
-                               "ModelControlStatus poll", url)
-            resp === nothing && return
+            # round, as if not ready. A hung call (timed out, not a fast refuse) means a poisoned
+            # connection; drop it so the next poll reconnects fresh.
+            resp, to = _bounded(() -> fetch_control_status(wc), POLL_TIMEOUT_SECONDS, nothing,
+                                "ModelControlStatus poll", url)
+            if resp === nothing
+                to && reset_clients!(wc)
+                return
+            end
             lock(lk) do
                 push!(polled, url)
                 mem_cap[url] = Float64(resp.weight_cache_max_bytes)
@@ -520,7 +524,9 @@ function verify_lpt_packing_preconditions!(pool::ClientPool; wait_seconds::Real=
                                 "ModelControlStatus poll", wc.url)
             if resp === nothing
                 push!(pending, wc.url)
-                to && (timed_out += 1)
+                # A hung call (not a fast refuse) means the worker was caught mid-stall and its
+                # connection is poisoned; drop it so the next poll reconnects fresh.
+                to && (timed_out += 1; reset_clients!(wc))
             else
                 statuses[wc.url] = resp
             end
