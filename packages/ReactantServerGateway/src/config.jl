@@ -47,9 +47,17 @@ struct GatewayConfig
     default_replicas::Int
     # Request routing within a model's replica set. `routing_fill_factor` is the per-replica fill
     # target as a multiple of the model's max batch size (1.0 fills exactly one batch before moving
-    # on; >1 over-provisions to keep the next batch queued). `routing_policy` is "fill" (concentrate
-    # to fill a batch, then the least-filled replica) or "least_outstanding" (the GPU with the least
-    # total in-flight work).
+    # on; >1 over-provisions to keep the next batch queued). `routing_policy` selects where a new
+    # batch starts (all `fill_*` variants still concentrate to fill one replica's batch before the
+    # next; they differ only in which replica a fresh batch opens on):
+    #   "fill_rr"     round-robins the starting replica across the model's set (default).
+    #   "fill_least"  starts on the replica with the least in-flight compute load (in-flight
+    #                 requests weighted by the model's measured per-request cost), so a model's
+    #                 batches open on whichever GPU is least busy across all models.
+    #   "least_outstanding"  the non-concentrating option: every request goes to the GPU with the
+    #                 least total in-flight work (no batch concentration).
+    # "fill" is a deprecated alias of "fill_rr" (warned at load); the old URL-first behavior, which
+    # opened every model's first batch on the same lowest-URL GPU, is gone.
     routing_fill_factor::Float64
     routing_policy::String
     models::Dict{String,GatewayModelConfig}
@@ -170,9 +178,13 @@ function _build_gateway_config(raw::Dict{String,Any})
     scheduling_mode = lowercase(strip(_opt(sched, "mode", String, "round_robin")))
     scheduling_mode in ("round_robin", "lpt_packing") ||
         throw(ConfigError("scheduling.mode must be 'round_robin' or 'lpt_packing', got '$scheduling_mode'"))
-    routing_policy = lowercase(strip(_opt(sched, "routing_policy", String, "fill")))
-    routing_policy in ("fill", "least_outstanding") ||
-        throw(ConfigError("scheduling.routing_policy must be 'fill' or 'least_outstanding', got '$routing_policy'"))
+    routing_policy = lowercase(strip(_opt(sched, "routing_policy", String, "fill_rr")))
+    if routing_policy == "fill"
+        @warn "scheduling.routing_policy 'fill' is deprecated; use 'fill_rr' (its replacement) or 'fill_least'. Treating as 'fill_rr'."
+        routing_policy = "fill_rr"
+    end
+    routing_policy in ("fill_rr", "fill_least", "least_outstanding") ||
+        throw(ConfigError("scheduling.routing_policy must be 'fill_rr', 'fill_least', or 'least_outstanding', got '$routing_policy'"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),

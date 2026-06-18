@@ -150,7 +150,7 @@ See [Multi-GPU Gateway](multi_gpu_gateway.md) and [Scaling to Multiple GPUs](sca
 
 - ReactantServerGateway `lpt_packing` with a configurable replica count per model and coalescing-aware routing across those replicas
 
-**How to configure it.** Set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose `routing_policy: least_outstanding` when replicas share GPUs with other models. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
+**How to configure it.** Set `scheduling.mode: lpt_packing` in `gateway.yml` and give the replicated model a replica count, either with `scheduling.default_replicas` or per model under `scheduling.models.<name>.replicas`. The gateway places each model on that many distinct GPUs and routes its requests to fill one replica's batch before moving to the next, so coalescing is preserved across replicas rather than diluted. Tune `routing_fill_factor` (raise it above 1.0 to keep the next batch queued under fast arrival) and choose a `routing_policy`: `fill_rr` (default) round-robins which replica opens each batch, `fill_least` opens it on the least compute-loaded GPU (best when replicas share GPUs with other models), and `least_outstanding` spreads every request without concentrating. See [Multi-GPU Gateway](multi_gpu_gateway.md) for the full set of knobs.
 
 Replica counts are fixed at startup; a model does not fan out automatically under load. Size the replica count for the model's expected concurrency, and rely on the per-GPU queue and batch coalescing to absorb bursts on each replica.
 
@@ -166,7 +166,7 @@ scheduling:
   default_replicas: 1               # most models on one GPU
   rebalance_compute_seconds: 30
   routing_fill_factor: 1.0          # raise above 1 to keep the next batch queued under bursty load
-  routing_policy: fill              # or least_outstanding when replicas share GPUs with other models
+  routing_policy: fill_rr           # fill_least when replicas share GPUs with other models; least_outstanding to spread
   models:
     resnet50:
       replicas: 2                   # served on 2 distinct GPUs; requests routed to fill batches
