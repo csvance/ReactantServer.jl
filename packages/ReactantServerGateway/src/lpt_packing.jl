@@ -61,12 +61,24 @@ longer present are ignored in `prev`. Cold models (no traffic yet) carry `u[m] =
 like any other, packed by memory; models absent from `u` entirely are not placed and the caller
 routes them uniformly. Load never changes a model's `k`; replica count is fixed by configuration.
 """
+# Optional per-repack diagnostics filled by `compute_assignment` (single-replica hysteresis only).
+# `held` counts models whose lowest-pressure worker differed from their current one but that stayed
+# put because the improvement was under the hysteresis threshold. `max_improvement` is the largest
+# available relative pressure reduction across single-replica models (taken or not), so a caller can
+# see where the fleet sits relative to the threshold even when nothing moved.
+mutable struct RepackStats
+    held::Int
+    max_improvement::Float64
+end
+RepackStats() = RepackStats(0, 0.0)
+
 function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
                             prev::Dict{String,Placement};
                             mem::Dict{String,Float64}=Dict{String,Float64}(),
                             mem_cap::Dict{String,Float64}=Dict{String,Float64}(),
                             replicas::Dict{String,Int}=Dict{String,Int}(),
-                            default_replicas::Int=1, hysteresis::Float64=0.1)
+                            default_replicas::Int=1, hysteresis::Float64=0.1,
+                            stats::Union{Nothing,RepackStats}=nothing)
     out = Dict{String,Placement}()
     isempty(workers) && return out
     cload = Dict{String,Float64}(w => 0.0 for w in workers)   # compute, normalized (capacity 1.0)
@@ -90,7 +102,16 @@ function compute_assignment(u::Dict{String,Float64}, workers::Vector{String},
             # model's resulting pressure by more than the threshold.
             if prev_pl !== nothing && length(prev_pl) == 1 && haskey(cload, prev_pl[1][1])
                 wp = prev_pl[1][1]
-                score_after(wp, um, wm) <= score_after(best, um, wm) * (1 + hysteresis) && (chosen = wp)
+                bestscore = score_after(best, um, wm)
+                prevscore = score_after(wp, um, wm)
+                if stats !== nothing
+                    impr = bestscore > 0 ? (prevscore / bestscore - 1.0) : 0.0
+                    impr > stats.max_improvement && (stats.max_improvement = impr)
+                end
+                if prevscore <= bestscore * (1 + hysteresis)
+                    chosen = wp
+                    stats !== nothing && best != wp && (stats.held += 1)
+                end
             end
             out[m] = [(chosen, 1.0)]
             cload[chosen] += um
@@ -272,6 +293,10 @@ end
 # gets a uniform placement over the workers that do serve it, with a warning.
 function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothing})
     now = time()
+    # Elapsed since the last repack, for the repack log: wall time and the fleet GPU-seconds that
+    # accumulated (the compute that triggered this repack). Captured before they are reset below.
+    wall_elapsed = s.last_rebalance == 0.0 ? 0.0 : now - s.last_rebalance
+    compute_elapsed = s.compute_accum
     dt = s.last_rebalance == 0.0 ? s.rate_halflife : max(now - s.last_rebalance, 1e-3)
     s.last_rebalance = now
 
@@ -313,16 +338,27 @@ function _repack!(s::LptPackingState, poll, metrics::Union{GatewayMetrics,Nothin
     end
 
     prev = @atomic s.assignment
+    stats = RepackStats()
     next = compute_assignment(full, sort(poll.polled), prev;
                               mem=poll.mem, mem_cap=poll.mem_cap,
                               replicas=s.model_replicas, default_replicas=s.default_replicas,
-                              hysteresis=s.hysteresis)
+                              hysteresis=s.hysteresis, stats=stats)
     merge!(next, drifted)
     @atomic s.assignment = next
     _swap_outstanding!(s, next)
 
     s.compute_accum = 0.0
     s.last_fleet_compute = poll.fleet_compute
+
+    # Count models whose worker set changed from the previous assignment (a model new this repack is
+    # an initial placement, not a move, so it is not counted).
+    moved = 0
+    for (m, placement) in next
+        prevpl = get(prev, m, nothing)
+        prevpl === nothing && continue
+        Set(first.(placement)) == Set(first.(prevpl)) || (moved += 1)
+    end
+    @info "lpt_packing: repack" models = length(next) moved = moved held_by_hysteresis = stats.held max_improvement = round(stats.max_improvement; digits = 3) hysteresis = s.hysteresis compute_seconds = round(compute_elapsed; digits = 2) wall_seconds = round(wall_elapsed; digits = 1)
 
     # Memory oversubscription warning: when a worker's assigned weight footprint exceeds its
     # on-demand budget the packing is infeasible (total weights outgrew the fleet); the worker's
