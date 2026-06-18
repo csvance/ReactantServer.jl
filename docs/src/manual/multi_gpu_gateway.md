@@ -63,7 +63,7 @@ scheduling:
   hysteresis: 0.1               # minimum improvement before a model moves workers
   default_replicas: 1           # GPUs per model unless overridden below (a number, or "all")
   routing_fill_factor: 1.0      # per-replica fill target as a multiple of max batch size
-  routing_policy: fill          # fill (default) | least_outstanding
+  routing_policy: fill_rr       # fill_rr (default) | fill_least | least_outstanding
   models:
     big-model:
       replicas: 2               # this model is placed on 2 distinct GPUs (a number, or "all")
@@ -109,13 +109,31 @@ idle fleet does not repack until traffic resumes.
 
 For a model with more than one replica, the gateway routes to fill one replica's batch before
 moving to the next, so the workers receive favorable groupings to coalesce (the coalescing itself
-stays at the worker). It tracks the in-flight request count per replica and, under the default
-`fill` policy, sends requests to the replica with the fewest full batches until it holds about
-`routing_fill_factor` times the model's max batch size, then moves to the next least-filled
-replica. Set `routing_fill_factor` above 1.0 to keep the next batch queued so a worker does not go
-idle between dispatches. The `least_outstanding` policy instead routes to the GPU with the least
-total in-flight work, which helps when replicas share GPUs with other models. A single-replica
-model is the degenerate case: all its requests go to its one GPU.
+stays at the worker). It tracks the in-flight request count per replica and keeps sending a model's
+requests to the replica it is currently filling until that replica holds about `routing_fill_factor`
+times the model's max batch size, then opens a fresh batch on another replica. Set
+`routing_fill_factor` above 1.0 to keep the next batch queued so a worker does not go idle between
+dispatches.
+
+`routing_policy` decides only *which* replica a fresh batch opens on (all the `fill_*` variants
+preserve the fill-one-replica-first behavior above; they differ only at the batch boundary):
+
+- **`fill_rr`** (default) round-robins the opening replica across the model's set, so successive
+  batches of the same model spread evenly over its GPUs.
+- **`fill_least`** opens each batch on the replica whose GPU currently carries the least in-flight
+  compute load, measured across *all* models as in-flight requests weighted by each model's
+  measured per-request compute cost. Prefer this when replicas share GPUs with other models, so a
+  model's batches open on whichever of its GPUs is least busy rather than always the same one.
+- **`least_outstanding`** drops concentration entirely and sends every request to the GPU with the
+  least total in-flight work. Use it only when you want even spreading over batching.
+
+A single-replica model is the degenerate case: all its requests go to its one GPU (and still count
+toward that GPU's load for the `fill_least` decisions of models that share it).
+
+!!! note "`fill` is deprecated"
+    The earlier `routing_policy: fill` is still accepted as an alias of `fill_rr` and logs a
+    deprecation warning at startup. Its old behavior opened every model's first batch on the same
+    lowest-address GPU, which concentrated cold traffic onto one card; `fill_rr` replaces it.
 
 `lpt_packing` has two preconditions, verified at gateway startup: every worker must run the `fifo`
 scheduler discipline (placement decisions move to the gateway, so workers should not re-order

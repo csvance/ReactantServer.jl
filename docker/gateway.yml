@@ -31,7 +31,7 @@ logging:
 #   min_rebalance_seconds: 0.0      # wall-clock floor between repacks (0 = none)
 #   default_replicas: 1             # GPUs per model unless overridden below (a number, or "all")
 #   routing_fill_factor: 1.0        # per-replica fill target as a multiple of max batch size
-#   routing_policy: fill            # fill | least_outstanding
+#   routing_policy: fill_rr         # fill_rr (default) | fill_least | least_outstanding
 #   models:
 #     resnet50:
 #       replicas: 2                 # this model on 2 distinct GPUs (a number, or "all")

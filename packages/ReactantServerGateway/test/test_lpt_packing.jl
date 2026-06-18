@@ -85,9 +85,30 @@ end
     @test_throws ReactantServerCore.ConfigError _load("scheduling:\n  default_replicas: huge\n" * eps)
 end
 
+@testset "config: routing_policy accepts the fill variants and deprecates 'fill'" begin
+    function _load(yaml)
+        path = tempname() * ".yaml"
+        write(path, yaml)
+        try
+            return GW.load_gateway(path)
+        finally
+            rm(path; force = true)
+        end
+    end
+    eps = "endpoints:\n  - \"127.0.0.1:7001\"\n"
+    _pol(p) = _load("scheduling:\n  routing_policy: $p\n" * eps).routing_policy
+    @test _pol("fill_rr") == "fill_rr"
+    @test _pol("fill_least") == "fill_least"
+    @test _pol("least_outstanding") == "least_outstanding"
+    @test _load(eps).routing_policy == "fill_rr"                      # default
+    # 'fill' is a deprecated alias of 'fill_rr': warns, but resolves rather than failing.
+    @test (@test_logs (:warn,) _pol("fill")) == "fill_rr"
+    @test_throws ReactantServerCore.ConfigError _pol("bogus")
+end
+
 @testset "verify_lpt_packing_preconditions!: gates on worker reachability" begin
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", ["127.0.0.1:1"], String[], 1, 1, 1, "info",
-                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill",
+                           "json", "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, 1.0, "fill_rr",
                            Dict{String,GW.GatewayModelConfig}())
     pool = GW.ClientPool(cfg)
     # Default (wait_seconds = 0) fails fast when a worker is unreachable.
@@ -152,14 +173,18 @@ end
     @test asn3["a"][1][1] in W
 end
 
-# Build a packing state directly for routing unit tests, with a two-replica placement installed.
-function _pk_state(; routing_policy = "fill", fill_factor = 1.0, max_batch = 8)
+# Build a packing state directly for routing unit tests. Defaults to a single two-replica model
+# "m" on w0/w1; callers can install their own placement, per-model costs, and max batches.
+function _pk_state(; routing_policy = "fill_rr", fill_factor = 1.0, max_batch = 8,
+                   assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)]),
+                   costs = nothing)
     cfg = GW.GatewayConfig("0.0.0.0:0", "0.0.0.0:0", String[], String[], 60, 1, 1, "info", "json",
                            "lpt_packing", 30.0, 0.0, 0.8, 0.1, 30.0, 1, fill_factor, routing_policy,
                            Dict{String,GW.GatewayModelConfig}())
     s = GW.LptPackingState(cfg)
-    @atomic s.assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)])
-    @atomic s.max_batch = Dict("m" => max_batch)
+    @atomic s.assignment = assignment
+    @atomic s.max_batch = Dict(m => max_batch for m in keys(assignment))
+    costs === nothing || (@atomic s.cost_snapshot = costs)
     GW._swap_outstanding!(s, (@atomic s.assignment))
     return s
 end
@@ -178,12 +203,49 @@ end
     @test all(==(f2[1]), f2)
     @test GW.route_replica(s2, "m")[1][1] != f2[1]
 
-    # single-replica fast path: no counters; cold model falls back to round robin.
-    @atomic s.assignment = Dict{String,GW.Placement}("solo" => [("w0", 1.0)])
-    GW._swap_outstanding!(s, (@atomic s.assignment))
-    urls, counters = GW.route_replica(s, "solo")
-    @test urls == ["w0"] && counters === nothing
-    @test GW.route_replica(s, "unknown") === nothing
+    # single-replica fast path: still reserves (so its load is visible to fill_least), but routes
+    # to its sole worker. A cold/unknown model falls back to round robin (nothing).
+    s3 = _pk_state(; assignment = Dict{String,GW.Placement}("solo" => [("w0", 1.0)]))
+    urls, counters = GW.route_replica(s3, "solo")
+    @test urls == ["w0"] && counters !== nothing
+    @test (@atomic s3.worker_load)["w0"][] > 0                # the single-replica request loads w0
+    GW._release_route!(counters)
+    @test (@atomic s3.worker_load)["w0"][] == 0
+    @test GW.route_replica(s3, "unknown") === nothing
+end
+
+@testset "route_replica: fill_rr rotates which replica opens each batch" begin
+    s = _pk_state(; routing_policy = "fill_rr", max_batch = 8)
+    # Each batch start (the model idle) opens on the next replica in rotation.
+    picks = String[]
+    for _ in 1:4
+        urls, c = GW.route_replica(s, "m")
+        push!(picks, urls[1])
+        GW._release_route!(c)                                 # complete it: idle again for next start
+    end
+    @test picks == ["w0", "w1", "w0", "w1"]
+
+    # Mid-fill never rotates: requests held in flight concentrate on the one open replica.
+    held = [GW.route_replica(s, "m") for _ in 1:5]
+    @test all(==(held[1][1][1]), [h[1][1] for h in held])
+    foreach(h -> GW._release_route!(h[2]), held)
+end
+
+@testset "route_replica: fill_least opens on the least compute-loaded GPU" begin
+    # m is replicated on w0/w1; an expensive single-replica model "hot" lives on w0. Routing hot
+    # loads w0 (single-replica load counts), so m's next batch opens on the idle w1 even though both
+    # replicas hold zero of m's own requests.
+    s = _pk_state(; routing_policy = "fill_least",
+                  assignment = Dict{String,GW.Placement}("m" => [("w0", 0.5), ("w1", 0.5)],
+                                                         "hot" => [("w0", 1.0)]),
+                  costs = Dict("hot" => 10.0, "m" => 1.0))
+    _, hc = GW.route_replica(s, "hot")
+    @test (@atomic s.worker_load)["w0"][] == 10.0             # hot's measured cost weights the load
+    @test GW.route_replica(s, "m")[1][1] == "w1"             # m avoids the busy w0
+
+    # With both GPUs equally loaded the choice falls back to the deterministic URL tiebreak.
+    s2 = _pk_state(; routing_policy = "fill_least")
+    @test GW.route_replica(s2, "m")[1][1] == "w0"
 end
 
 @testset "route_replica: release frees the counter on every path" begin
