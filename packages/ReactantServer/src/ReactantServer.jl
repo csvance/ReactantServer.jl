@@ -66,6 +66,10 @@ include("scheduler.jl")
 # (it drives load_model!/evict!) and before server.jl (RunningServer holds a BundleWatcher).
 include("watcher.jl")
 
+# Self-contained detection glue (anchors/decode/NMS/roi_align) for two-stage detector meta models.
+# Referenced from a bundle's model.jl as ReactantServer.DetectionGlue. No deps on the runtime above.
+include("postprocess/detection.jl")
+
 # Meta-model execution (the ModelCaller abstraction + run_meta). After the scheduler (LocalCaller
 # wraps it) and before grpc.jl (InferContext holds a ModelCaller and _handle_infer dispatches meta).
 include("meta.jl")

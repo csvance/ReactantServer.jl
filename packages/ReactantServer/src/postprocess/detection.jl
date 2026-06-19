@@ -220,4 +220,48 @@ function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, propos
     return (boxes[keep, :], cs[keep], cc[keep])
 end
 
+# --- layout helpers: bundle outputs are Julia column-major (W,H,C,1) = reverse of torch (1,C,H,W) ---
+
+"""
+    objectness_flat(O) -> Vector
+
+RPN objectness `O` (W,H,A,1) flattened to (h,w,a) order to match `generate_anchors` and
+`obj.permute(0,2,3,1).flatten`.
+"""
+function objectness_flat(O::AbstractArray)
+    Wd, Hd, A = size(O, 1), size(O, 2), size(O, 3)
+    v = Vector{Float64}(undef, Hd * Wd * A); r = 0
+    @inbounds for h in 1:Hd, w in 1:Wd, a in 1:A
+        r += 1; v[r] = O[w, h, a, 1]
+    end
+    return v
+end
+
+"""
+    deltas_matrix(D) -> [H*W*A, 4]
+
+RPN anchor deltas `D` (W,H,4A,1) reshaped to [H*W*A,4] in (h,w,a) order (a inner), matching the
+RPN forward's view/permute/flatten.
+"""
+function deltas_matrix(D::AbstractArray)
+    Wd, Hd = size(D, 1), size(D, 2); A = size(D, 3) ÷ 4
+    m = Matrix{Float64}(undef, Hd * Wd * A, 4); r = 0
+    @inbounds for h in 1:Hd, w in 1:Wd, a in 0:(A - 1)
+        r += 1
+        m[r, 1] = D[w, h, 4a + 1, 1]; m[r, 2] = D[w, h, 4a + 2, 1]
+        m[r, 3] = D[w, h, 4a + 3, 1]; m[r, 4] = D[w, h, 4a + 4, 1]
+    end
+    return m
+end
+
+"feature map (W,H,C,1) -> [C,H,W] for roi_align!"
+feature_chw(F::AbstractArray) = permutedims(dropdims(F; dims=4), (3, 2, 1))
+
+"detectron2 ROIPooler level for a box: clamp(floor(log2(sqrt(area)/canon_size+1e-8)+canon_level),min,max)-min"
+function assign_level(box::AbstractVector; canon_level::Int=4, canon_size::Real=224,
+                      min_level::Int=2, max_level::Int=5)
+    area = max(0.0, (box[3] - box[1]) * (box[4] - box[2]))
+    return Int(clamp(floor(log2(sqrt(area) / canon_size + 1e-8) + canon_level), min_level, max_level)) - min_level
+end
+
 end # module DetectionGlue
