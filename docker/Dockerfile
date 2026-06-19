@@ -20,7 +20,8 @@ FROM docker.io/library/julia:1.12.6-trixie
 
 ENV JULIA_DEPOT_PATH=/opt/julia-depot \
     JULIA_PROJECT=/opt/reactantserver \
-    REACTANT_WORKSPACE_ROOT=/opt/reactantserver
+    REACTANT_WORKSPACE_ROOT=/opt/reactantserver \
+    JULIA_SSL_CA_ROOTS_PATH=/etc/ssl/certs/ca-certificates.crt
 
 # git/CA certs for the General registry and artifact downloads during instantiate;
 # build-essential (make + C toolchain) so packages with a native build step, e.g.
@@ -29,6 +30,16 @@ ENV JULIA_DEPOT_PATH=/opt/julia-depot \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates build-essential tini curl \
  && rm -rf /var/lib/apt/lists/*
+
+# Corporate TLS-inspection (MITM) trust. On networks where an inspecting proxy re-signs HTTPS with
+# an internal root CA, drop that root (PEM, .crt extension) into docker/certs/ and it is added to
+# the system trust store here. JULIA_SSL_CA_ROOTS_PATH (below) then points Julia's NetworkOptions
+# at the resulting system bundle, so both Downloads.jl/libcurl (registry + artifact downloads) and
+# LibGit2 (the registry git clone fallback) accept the proxy's certificates. update-ca-certificates
+# only processes *.crt, so the directory's README is ignored; with no cert present this is a no-op
+# and the build behaves exactly as before.
+COPY docker/certs/ /usr/local/share/ca-certificates/
+RUN update-ca-certificates
 
 WORKDIR /opt/reactantserver
 
