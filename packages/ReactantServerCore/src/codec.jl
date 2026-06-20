@@ -274,6 +274,39 @@ function encode_infer_request(model_name::AbstractString, inputs::Vector{NamedTe
         inputs=in_tensors, outputs=outs, raw_input_contents=raw)
 end
 
+# Build an InferInputTensor that references bytes already staged in a shared-memory region rather
+# than inlining them (the meta fan-out's transport==scratch path; mirrors the client encoder).
+function _shm_input_tensor(t::NamedTensor, region::AbstractString, offset::Integer, byte_size::Integer)
+    wire_shape = Int64[Int64(s) for s in reverse(collect(t.shape))]
+    params = Dict{String,_PB_INF.InferParameter}(
+        _SHM_REGION => _string_param(region),
+        _SHM_OFFSET => _int_param(offset),
+        _SHM_BYTE_SIZE => _int_param(byte_size))
+    return _PB_INF.var"ModelInferRequest.InferInputTensor"(;
+        name=t.name, datatype=kserve_string(t.dtype), shape=wire_shape, parameters=params)
+end
+
+"""
+    encode_infer_request_shm(model_name, inputs, region, offsets; requested_outputs, id)
+
+Encode a request whose inputs are ALL staged in shared-memory `region` at the given byte `offsets`
+(parallel to `inputs`); no `raw_input_contents` — the receiver reads each tensor via `shm_read`. The
+receiver must have `region` registered. This is all-or-nothing per request: the decode path treats
+`raw_input_contents` as parallel-to-inputs, so a request never mixes raw and SHM inputs.
+"""
+function encode_infer_request_shm(model_name::AbstractString, inputs::Vector{NamedTensor},
+                                  region::AbstractString, offsets::Vector{<:Integer};
+                                  requested_outputs::Vector{String}=String[], id::AbstractString="")
+    length(offsets) == length(inputs) ||
+        throw(ArgumentError("encode_infer_request_shm: offsets ($(length(offsets))) != inputs ($(length(inputs)))"))
+    in_tensors = [_shm_input_tensor(inputs[i], region, offsets[i], sizeof(inputs[i].data))
+                  for i in eachindex(inputs)]
+    outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
+        _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
+    return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
+        inputs=in_tensors, outputs=outs)
+end
+
 """
     decode_infer_response(msg) -> Vector{NamedTensor}
 

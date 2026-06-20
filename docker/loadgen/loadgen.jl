@@ -18,6 +18,7 @@
 #   LOADGEN_MODELS            comma list to restrict the set   (default: all bundles)
 
 using ReactantServerClient
+using ReactantServerCore: load_manifest   # to read meta.calls and skip internal sub-bundles
 using Base.Threads
 
 # ---- config ----------------------------------------------------------------------------------
@@ -31,6 +32,14 @@ const DURATION    = parse(Float64, env("LOADGEN_DURATION_SECONDS", "3600"))
 const TRANSPORT   = Symbol(env("LOADGEN_TRANSPORT", "tcp"))   # :tcp | :shm | :mixed
 const SHM_OUTPUTS = lowercase(env("LOADGEN_SHM_OUTPUTS", "true")) in ("1", "true", "yes", "on")
 const REPORT_SEC  = parse(Float64, env("LOADGEN_REPORT_SECONDS", "30"))
+# Serial warmup before the concurrent soak: one request per model with a long deadline. The first
+# request to a model triggers Reactant compilation (often >10s); firing 32 concurrent cold requests
+# instead stampedes the gRPCClient libcurl multi-handle into a wedge, so the soak never makes
+# progress until manually restarted against warm models. A serial pass (no stampede) + a long
+# deadline (tolerates compilation) compiles every model — and warming a meta fans out to compile its
+# sub-models — so the soak then hits only warm models. Set LOADGEN_WARMUP=false to skip.
+const WARMUP          = lowercase(env("LOADGEN_WARMUP", "true")) != "false"
+const WARMUP_DEADLINE = parse(Float64, env("LOADGEN_WARMUP_DEADLINE", "300"))
 
 # KServe wire dtype string -> Julia type. Covers the dtypes the bundles use; extend if needed.
 const DTYPE = Dict(
@@ -96,6 +105,26 @@ function output_shm_specs(io)
     return specs
 end
 
+# Models that are internal sub-bundles of a meta model (declared in some meta's meta.calls, e.g.
+# <m>_stage1 / <m>_stage2 / <m>_core). Clients call the meta, which fans out to these; soaking them
+# directly doubles their queue load with zero/garbage inputs and congests the queues the metas wait
+# on. Skipped by default; set LOADGEN_SKIP_INTERNAL=false to soak them anyway.
+function _internal_submodels(names)
+    internal = Set{String}()
+    for name in names
+        mf = joinpath(MODEL_REPO, name, "manifest.yaml")
+        isfile(mf) || continue
+        try
+            for c in load_manifest(mf).meta_calls
+                push!(internal, String(c))
+            end
+        catch err
+            @warn "could not read meta.calls" model = name exception = err
+        end
+    end
+    return internal
+end
+
 function discover_models()
     names = readdir(MODEL_REPO)
     want = get(ENV, "LOADGEN_MODELS", "")
@@ -103,8 +132,12 @@ function discover_models()
         sel = Set(strip.(split(want, ",")))
         names = filter(in(sel), names)
     end
+    skip_internal = lowercase(env("LOADGEN_SKIP_INTERNAL", "true")) != "false"
+    internal = skip_internal ? _internal_submodels(names) : Set{String}()
+    isempty(internal) || @info "skipping internal meta sub-bundles" count = length(internal) models = sort(collect(internal))
     specs = ModelSpec[]
     for name in sort(names)
+        name in internal && continue
         manifest = joinpath(MODEL_REPO, name, "manifest.yaml")
         isfile(manifest) || continue
         local spec
@@ -204,6 +237,24 @@ function fire(spec::ModelSpec, use_shm::Bool)
     return nothing
 end
 
+# Serial warmup: fire one request per model with a long deadline so first-request compilation
+# completes before the concurrent soak begins (see WARMUP comment). Sequential by design — a
+# concurrent cold stampede wedges the gRPCClient multi-handle. Failures are logged, not fatal.
+function warmup(specs::Vector{ModelSpec})
+    println("warmup: priming $(length(specs)) models serially (deadline $(WARMUP_DEADLINE)s) ...")
+    t0 = time(); ok = 0
+    for spec in specs
+        m = KServeModel(GATEWAY, spec.name; max_batch_size = 1, deadline = WARMUP_DEADLINE)
+        try
+            infer_sync(m, spec.tcp_inputs)
+            ok += 1
+        catch err
+            @warn "warmup failed (continuing)" model = spec.name exception = err
+        end
+    end
+    println("warmup: $ok/$(length(specs)) models primed in $(round(time() - t0, digits = 1))s")
+end
+
 # ---- metrics scrape (via curl; no extra Julia deps) -------------------------------------------
 
 # Sum a Prometheus counter across all of its label series (one per worker/gpu). The value is the
@@ -241,6 +292,8 @@ function main()
     specs = discover_models()
     isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
     println("discovered $(length(specs)) models; starting soak with $(nthreads()) threads")
+
+    WARMUP && warmup(specs)
 
     deadline = time() + DURATION
     pick_shm(i) = TRANSPORT === :shm ? true : TRANSPORT === :mixed ? isodd(i) : false

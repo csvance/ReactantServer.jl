@@ -75,6 +75,7 @@ export memory_from_shm, memory_from_bytes, fsa_from_memory
 # ---- buffer pool ----
 export BufferPool, PoolSlot, acquire_slot!, release_slot!, subslot, reset_slot!
 export pool_view, pool_memory, pool_fsa, is_shm_backed
+export pool_base_pointer, pool_region_name, pool_slot_bytes
 
 # ---- weight store ----
 export WeightStore, PrivateWeightStore, SharedWeightStore
@@ -112,6 +113,6 @@ export shm_regions, shm_teardown!
 # ---- codec ----
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
 export encode_repository_index, encode_shm_status, encode_shm_register_response, encode_shm_unregister_response, id_of
-export encode_infer_request, decode_infer_response
+export encode_infer_request, encode_infer_request_shm, decode_infer_response
 
 end # module ReactantServerCore

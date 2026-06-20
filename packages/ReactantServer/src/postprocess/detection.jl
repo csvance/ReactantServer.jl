@@ -159,6 +159,42 @@ function roi_align!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
     return out
 end
 
+"""
+    roi_align_wire!(out, feat, boxes, scale; pooled=7, ratio=0)
+
+ROIAlign writing directly into the executable's WIRE layout `out` [pooled,pooled,C,K] =
+(pw,ph,C,K) (the Julia col-major reverse of torch [K,C,7,7]), instead of [K,C,7,7]+permutedims.
+Lets a meta stage ROI features straight into a shared-memory scratch slot. Same per-element math as
+`roi_align!` (the value is computed in Float64 and rounded once on store), so an `out::Array{Float32}`
+is bit-identical to the old `Float64` roi_align + final `Float32` convert.
+"""
+function roi_align_wire!(out::AbstractArray{<:Real,4}, feat::AbstractArray{<:Real,3},
+                         boxes::AbstractMatrix, scale::Real; pooled::Int=7, ratio::Int=0)
+    C, H, W = size(feat)
+    K = size(boxes, 1)
+    @inbounds for k in 1:K
+        sw = boxes[k, 1] * scale - 0.5; sh = boxes[k, 2] * scale - 0.5
+        ew = boxes[k, 3] * scale - 0.5; eh = boxes[k, 4] * scale - 0.5
+        rw = ew - sw; rh = eh - sh
+        bw = rw / pooled; bh = rh / pooled
+        gh = ratio > 0 ? ratio : max(1, ceil(Int, rh / pooled))
+        gw = ratio > 0 ? ratio : max(1, ceil(Int, rw / pooled))
+        cnt = gh * gw
+        for c in 1:C, ph in 0:(pooled - 1), pw in 0:(pooled - 1)
+            s = 0.0
+            for iy in 0:(gh - 1)
+                y = sh + ph * bh + (iy + 0.5) * bh / gh
+                for ix in 0:(gw - 1)
+                    x = sw + pw * bw + (ix + 0.5) * bw / gw
+                    s += _bilinear(feat, c, y, x, H, W)
+                end
+            end
+            out[pw + 1, ph + 1, c, k] = s / cnt
+        end
+    end
+    return out
+end
+
 # --- orchestration: RPN proposal selection + fast-rcnn final inference ---
 
 """

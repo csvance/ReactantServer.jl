@@ -55,6 +55,8 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
                      grpc_port::Union{Integer,Nothing}=nothing,
                      metrics_port::Union{Integer,Nothing}=nothing,
                      loopback::Union{AbstractString,Nothing}=nothing,
+                     fanout_self::Union{AbstractString,Nothing}=nothing,
+                     fanout_peers::Union{AbstractString,Nothing}=nothing,
                      grace_seconds::Real=15.0)
     proj = joinpath(workspace_root, "packages", "ReactantServer")
     # `--threads=<compute_threads>,1`: a default pool sized to this worker's share of the host for
@@ -77,6 +79,11 @@ function worker_spec(name::AbstractString, node_file::AbstractString,
     # in-process), overriding any inherited value; `nothing` leaves REACTANT_LOOPBACK_GRPC to the
     # inherited environment (the external-gateway `workers` role sets it there).
     loopback === nothing || push!(pairs, "REACTANT_LOOPBACK_GRPC" => String(loopback))
+    # Shared-memory fan-out mesh: this worker's own region to create ("<key>:<bytes>:<slots>") and
+    # its peers' regions to attach ("<key>:<bytes>,..."), so a meta model can stage large sub-call
+    # inputs in shared memory via call.scratch instead of inlining them over the loopback gRPC.
+    fanout_self === nothing || push!(pairs, "REACTANT_FANOUT_SELF" => String(fanout_self))
+    fanout_peers === nothing || push!(pairs, "REACTANT_FANOUT_PEERS" => String(fanout_peers))
     return ChildSpec(String(name), addenv(cmd, pairs...), Float64(grace_seconds))
 end
 

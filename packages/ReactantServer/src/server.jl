@@ -138,13 +138,17 @@ serve_worker(node_path::AbstractString, worker::AbstractString; kwargs...) =
 
 function serve(cfg::ServerConfig; backend::AbstractBackend=ReactantBackend(), blocking::Bool=true,
                worker_name::AbstractString="")
-    pool, registry, sched, watcher = _bring_up(cfg, backend)
     shm = SharedMemoryRegistry()
+    # Create this worker's fan-out shared-memory region and attach peers' regions BEFORE the slow
+    # model load/compile in `_bring_up`, so the region exists immediately for peers' startup attach.
+    fanout = setup_fanout(shm)
+    pool, registry, sched, watcher = _bring_up(cfg, backend)
     metrics = WorkerMetrics(sched, backend, pool, cfg; worker_name=worker_name)
     router = build_grpc_router(sched, registry, pool.platform, shm)
     # Meta-model sub-calls route through this caller: a loopback gateway when REACTANT_LOOPBACK_GRPC
-    # is set (multi-worker), otherwise the local scheduler in-process (single-worker).
-    caller = build_caller(sched)
+    # is set (multi-worker), otherwise the local scheduler in-process (single-worker). The fan-out
+    # pool (when present) lets a meta stage large sub-call inputs in shared memory via call.scratch.
+    caller = build_caller(sched; pool=fanout)
     ctx = InferContext(sched, registry, shm, pool.platform, metrics, caller)
     # Optional Prometheus metrics endpoint (opt-in via endpoints.metrics_port > 0). Request counting
     # is always on (the InferContext carries `metrics`); only the HTTP listener is gated.

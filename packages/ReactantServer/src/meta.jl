@@ -25,10 +25,17 @@ call_model(c::LocalCaller, name::AbstractString, inputs::Vector{NamedTensor};
 # Loopback caller: routes a sub-call to the gateway over gRPC. The gateway's existing routing places
 # the backbone on whichever worker hosts it, so device placement stays abstracted from the meta
 # author. One client over one libcurl multi handle, built once at startup and reused concurrently.
+# `pool` is this worker's shared-memory fan-out region (or nothing): inputs whose bytes already live
+# in it are sent by SHM reference instead of inlined (see `_build_subcall_request`).
 struct GatewayCaller{C} <: ModelCaller
     url::String
     client::C
+    pool::Union{BufferPool,Nothing}
 end
+
+# The fan-out pool a caller can stage sub-call inputs into; nothing means inline-only (no wire).
+caller_pool(::LocalCaller) = nothing
+caller_pool(c::GatewayCaller) = c.pool
 
 # Split "host:port" (optionally with a grpc:// / grpcs:// scheme) into (host, port).
 function _split_loopback(url::AbstractString)
@@ -45,7 +52,8 @@ function _split_loopback(url::AbstractString)
 end
 
 function GatewayCaller(url::AbstractString; deadline::Real=300,
-                       max_msg_bytes::Integer=_MAX_MESSAGE_BYTES)
+                       max_msg_bytes::Integer=_MAX_MESSAGE_BYTES,
+                       pool::Union{BufferPool,Nothing}=nothing)
     host, port = _split_loopback(url)
     # sticky=false: meta orchestrations run on the worker's default (compute) thread pool, so the
     # multi handle's driving tasks must be schedulable on whichever thread issues the call.
@@ -53,12 +61,46 @@ function GatewayCaller(url::AbstractString; deadline::Real=300,
     client = GRPCInferenceService_ModelInfer_Client(host, port; grpc=grpc, deadline=deadline,
         TRequest=ModelInferRequest, TResponse=ModelInferResponse,
         max_send_message_length=max_msg_bytes, max_recieve_message_length=max_msg_bytes)
-    return GatewayCaller{typeof(client)}(String(url), client)
+    return GatewayCaller{typeof(client)}(String(url), client, pool)
+end
+
+# Byte offset of `a`'s data within the pool region [base, base+nbytes), or nothing if `a` is not a
+# contiguous (dense) array whose bytes lie entirely inside the region. Detection is by memory
+# location, not object identity, so a reshape/contiguous prefix of a scratch buffer is still found.
+function _region_offset(a::AbstractArray, base::Ptr, nbytes::Integer)
+    a isa DenseArray || return nothing            # DenseArray guarantees a contiguous pointer range
+    p = UInt(pointer(a)); b = UInt(base)
+    (b <= p && p + UInt(sizeof(a)) <= b + UInt(nbytes)) ? Int(p - b) : nothing
+end
+
+# Build a sub-call request. All-or-nothing per call (the decode path treats raw_input_contents as
+# parallel-to-inputs): if every input's bytes live in `pool`, send by SHM reference; otherwise inline.
+function _build_subcall_request(pool::Union{BufferPool,Nothing}, name::AbstractString,
+                                inputs::Vector{NamedTensor}, requested_outputs::Vector{String})
+    if pool !== nothing && !isempty(inputs)
+        base = pool_base_pointer(pool); nbytes = sizeof(pool)
+        offs = Int[]
+        ok = true
+        for t in inputs
+            o = _region_offset(t.data, base, nbytes)
+            o === nothing ? (ok = false; break) : push!(offs, o)
+        end
+        ok && return encode_infer_request_shm(name, inputs, pool_region_name(pool), offs;
+                                              requested_outputs=requested_outputs)
+        # A pool exists but some input is not a contiguous pool buffer: inline, and surface a large
+        # accidental fallback (e.g. the author copied or strided a scratch buffer) rather than letting
+        # it silently regress.
+        for t in inputs
+            sizeof(t.data) > 1_000_000 && _region_offset(t.data, base, nbytes) === nothing &&
+                @warn "meta sub-call input inlined instead of shared-memory (not a contiguous pool buffer)" model = name input = t.name bytes = sizeof(t.data) maxlog = 16
+        end
+    end
+    return encode_infer_request(name, inputs; requested_outputs=requested_outputs)
 end
 
 function call_model(c::GatewayCaller, name::AbstractString, inputs::Vector{NamedTensor};
                     requested_outputs::Vector{String}=String[])
-    req = encode_infer_request(name, inputs; requested_outputs=requested_outputs)
+    req = _build_subcall_request(c.pool, name, inputs, requested_outputs)
     resp = gRPCClient.grpc_sync_request(c.client, req)
     return decode_infer_response(resp)
 end
@@ -70,33 +112,137 @@ Construct the worker's process-wide meta-model caller from the environment: a [`
 when `REACTANT_LOOPBACK_GRPC` names a gateway (multi-worker mode), otherwise a [`LocalCaller`](@ref)
 over the local scheduler (single-worker mode).
 """
-function build_caller(sched::Scheduler)
+# Env naming the worker's own fan-out region ("<key>:<bytes>:<n_slots>") and its peers' regions
+# ("<key>:<bytes>,..."), injected by the supervisor's pool mesh. Absent => no fan-out pool (meta
+# sub-calls inline, as before).
+const FANOUT_SELF_ENV = "REACTANT_FANOUT_SELF"
+const FANOUT_PEERS_ENV = "REACTANT_FANOUT_PEERS"
+
+_region_basename(key::AbstractString) = startswith(key, "/") ? String(key[2:end]) : String(key)
+
+# Attach a peer's region read-only into `shm`, retrying while it may not be created yet (all workers
+# create their own region early, so a few seconds covers staggered startup). Best-effort: a peer that
+# never attaches just means producers targeting this worker fall back to inline (still correct).
+function _attach_peer!(shm::SharedMemoryRegistry, name::AbstractString, key::AbstractString,
+                       bytes::Integer; budget_s::Real=60.0)
+    t0 = time()
+    while true
+        try
+            shm_register!(shm, name, key, 0, bytes)
+            return true
+        catch err
+            if time() - t0 > budget_s
+                @warn "fan-out: peer region never attached; sub-calls to it will inline" region = name exception = err
+                return false
+            end
+            sleep(0.25)
+        end
+    end
+end
+
+# Build this worker's fan-out producer pool from the injected mesh and attach all peer regions
+# read-only into `shm` (so a sub-call routed here can read a peer's staged tensor). Returns the own
+# pool, or nothing if no mesh is configured or setup fails (meta sub-calls then inline — safe).
+function setup_fanout(shm::SharedMemoryRegistry)
+    self = strip(get(ENV, FANOUT_SELF_ENV, ""))
+    isempty(self) && return nothing
+    own = try
+        parts = split(self, ":")
+        length(parts) == 3 || error("REACTANT_FANOUT_SELF must be '<key>:<bytes>:<n_slots>', got $self")
+        BufferPool(parse(Int, parts[2]); n_slots=parse(Int, parts[3]), use_shm=true, key=String(parts[1]))
+    catch err
+        @warn "fan-out: could not create own region; meta sub-calls will inline" exception = err
+        return nothing
+    end
+    for ent in split(strip(get(ENV, FANOUT_PEERS_ENV, "")), ","; keepempty=false)
+        kb = split(ent, ":")
+        length(kb) == 2 && _attach_peer!(shm, _region_basename(kb[1]), String(kb[1]), parse(Int, kb[2]))
+    end
+    @info "fan-out pool ready" region = own.name bytes = sizeof(own) slots = own.n_slots
+    return own
+end
+
+function build_caller(sched::Scheduler; pool::Union{BufferPool,Nothing}=nothing)
     url = strip(get(ENV, LOOPBACK_ENV, ""))
     if isempty(url)
         return LocalCaller(sched)
     end
-    @info "Meta models will route sub-calls through the loopback gateway" endpoint = url
-    return GatewayCaller(String(url))
+    @info "Meta models will route sub-calls through the loopback gateway" endpoint = url has_pool = pool !== nothing
+    return GatewayCaller(String(url); pool=pool)
+end
+
+# The injected `call` handed to a meta model's `run(inputs, call)`. Callable to dispatch a sub-call
+# (`call(name, inputs)`), and exposes `call.scratch(...)` to request fan-out buffers. Tracks the pool
+# slots acquired this request so `run_meta` can release them when the orchestration returns.
+mutable struct MetaCall{C<:ModelCaller}
+    caller::C
+    name::String
+    declared::Set{String}
+    slots::Vector{PoolSlot}
+end
+MetaCall(caller::ModelCaller, name::AbstractString, declared) =
+    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[])
+
+# `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees.
+function (mc::MetaCall)(name::AbstractString, inputs::Vector{NamedTensor};
+                        requested_outputs::Vector{String}=String[])
+    String(name) in getfield(mc, :declared) ||
+        error("meta model '$(getfield(mc, :name))' called undeclared model '$name'; add it to meta.calls")
+    return call_model(getfield(mc, :caller), name, inputs; requested_outputs=requested_outputs)
+end
+
+# `call.scratch(...)` resolves to a closure over this MetaCall; every other field reads normally.
+function Base.getproperty(mc::MetaCall, s::Symbol)
+    s === :scratch && return (args...) -> _scratch(mc, args...)
+    return getfield(mc, s)
+end
+
+"""
+    call.scratch(dims, T) -> Array{T}
+    call.scratch([dims1 => T1, dims2 => T2, ...]) -> Vector{Array}
+
+Request fan-out scratch buffers for this request. With a pool (multi-worker), all requested buffers
+are carved from ONE contiguous acquired block (released when the orchestration returns) and writing
+into them then passing them to `call(...)` sends them by shared-memory reference. Without a pool
+(single-worker, in-process), returns plain heap arrays — identical model.jl code either way.
+"""
+_scratch(mc::MetaCall, dims, ::Type{T}) where {T} =
+    first(_scratch(mc, Pair[(dims isa Tuple ? dims : (dims,)) => T]))
+
+function _scratch(mc::MetaCall, reqs::AbstractVector)
+    specs = [(Tuple(first(r)), last(r)) for r in reqs]   # dims => T pairs
+    pool = caller_pool(getfield(mc, :caller))
+    if pool === nothing
+        return Any[Array{T}(undef, d...) for (d, T) in specs]
+    end
+    # One contiguous block fits everything (simple by design; revisit for fragmentation later).
+    total = sum(sizeof(T) * prod(d) for (d, T) in specs)
+    span = max(1, cld(total, pool_slot_bytes(pool)))
+    slot = acquire_slot!(pool, span)
+    push!(getfield(mc, :slots), slot)
+    return Any[pool_view(subslot(slot, sizeof(T) * prod(d)), T, d...) for (d, T) in specs]
 end
 
 """
     run_meta(entry, caller, inputs) -> Vector{NamedTensor}
 
-Run a meta model's orchestration. The injected `call(name, inputs)` closure dispatches a sub-call
-through `caller`; it rejects any callee the meta model did not declare in its manifest `meta.calls`,
-so the declared dependency set is authoritative at runtime.
+Run a meta model's orchestration. The injected `call` (a [`MetaCall`](@ref)) dispatches sub-calls
+through `caller`, rejecting any callee not declared in `meta.calls`, and offers `call.scratch` for
+fan-out buffers. Any pool slots the orchestration acquired via `scratch` are released here when it
+returns (request-scoped), robust to the author reusing a buffer across sub-calls.
 """
 function run_meta(entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor})
-    declared = Set(entry.calls)
-    call = function (name::AbstractString, ins::Vector{NamedTensor})
-        String(name) in declared ||
-            error("meta model '$(entry.name)' called undeclared model '$name'; add it to meta.calls")
-        return call_model(caller, name, ins)
+    mc = MetaCall(caller, entry.name, entry.calls)
+    try
+        # The orchestration is defined in a sandboxed model.jl (a newer world age), so cross it with
+        # invokelatest, exactly as infer() does for pre/post hooks.
+        out = Base.invokelatest(entry.run, inputs, mc)
+        out isa Vector{NamedTensor} ||
+            error("meta model '$(entry.name)' returned $(typeof(out)); expected Vector{NamedTensor}")
+        return out
+    finally
+        for s in getfield(mc, :slots)
+            release_slot!(s)
+        end
     end
-    # The orchestration is defined in a sandboxed model.jl (a newer world age), so cross it with
-    # invokelatest, exactly as infer() does for pre/post hooks.
-    out = Base.invokelatest(entry.run, inputs, call)
-    out isa Vector{NamedTensor} ||
-        error("meta model '$(entry.name)' returned $(typeof(out)); expected Vector{NamedTensor}")
-    return out
 end
