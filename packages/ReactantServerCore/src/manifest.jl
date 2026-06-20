@@ -23,7 +23,9 @@ const SUPPORTED_FORMAT_VERSIONS = ("2.0", "2")
 
 # A bundle is either a regular "model" (a StableHLO executable + weights) or a "meta" model: a
 # user-authored Julia workflow (model.jl) that chains other models with data-dependent logic in
-# between. A meta bundle carries no executable/weights and declares the models it calls.
+# between. A meta bundle carries no executable/weights and declares the models it calls. The call
+# list may be empty: a compute-only meta model does all its work in Julia and invokes no sub-model
+# (e.g. a small model reimplemented in pure Julia, shipping its own weights.safetensors).
 const SUPPORTED_KINDS = ("model", "meta")
 
 const _RESERVED_BATCH_LETTERS = ('n', 'b')
@@ -304,8 +306,7 @@ function validate_manifest(m::Manifest, dir::AbstractString, has_model_jl::Bool)
             throw(ManifestError("meta model '$(m.name)' must declare non-empty client_inputs"))
         (m.client_outputs !== nothing && !isempty(m.client_outputs)) ||
             throw(ManifestError("meta model '$(m.name)' must declare non-empty client_outputs"))
-        isempty(m.meta_calls) &&
-            throw(ManifestError("meta model '$(m.name)' declares no models in meta.calls"))
+        # An empty meta.calls list is allowed: a compute-only meta model invokes no sub-model.
         allunique(m.meta_calls) ||
             throw(ManifestError("meta model '$(m.name)' has duplicate entries in meta.calls"))
         m.name in m.meta_calls &&

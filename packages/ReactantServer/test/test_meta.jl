@@ -46,6 +46,11 @@ end
         "meta" => Dict("calls" => ["scale"]))) |> (m -> _RS.validate_manifest(m, "/tmp/d", true))
     # A meta model may not list itself.
     @test_throws _RS.ManifestError _RS.validate_manifest(_meta_manifest("d", ["d"]), "/tmp/d", true)
+    # A compute-only meta model may declare an empty calls list (does all work in Julia).
+    let mc = _meta_manifest("compute_only", String[])
+        @test mc.meta_calls == String[]
+        @test _RS.validate_manifest(mc, "/tmp/compute_only", true) === mc
+    end
 end
 
 @testset "meta model runs in worker mode via LocalCaller" begin
