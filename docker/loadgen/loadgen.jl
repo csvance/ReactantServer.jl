@@ -42,16 +42,29 @@ const DTYPE = Dict(
 
 # ---- model discovery + dummy-input synthesis --------------------------------------------------
 
-# One model's everything needed to fire a request: its gateway handle, the input tensor name and
-# Julia element type, the per-item Julia column-major dims (batch dropped), and a prebuilt inline
-# InferInput for the TCP path (immutable, so safe to reuse across requests).
+# One input tensor: its name, Julia element type, per-item Julia column-major dims (batch dropped),
+# and whether the manifest declares a batch axis for it. A model with `has_batch=false` is unbatched
+# (e.g. a meta core with mixed-rank inputs); we must NOT append a batch row to it, or it arrives one
+# rank too large.
+struct InputSpec
+    name::String
+    dtype::DataType
+    per_item_dims::Vector{Int}
+    has_batch::Bool
+end
+
+# Julia column-major wire dims for one input carrying `n` rows: batched inputs get the batch axis
+# appended (last, matching the manifest); unbatched inputs are sent at exactly their fixed dims.
+_wire_dims(inp::InputSpec, n::Int) = inp.has_batch ? Int[inp.per_item_dims..., n] : copy(inp.per_item_dims)
+
+# One model's everything needed to fire a request: its gateway handle, ALL of its input specs, the
+# prebuilt inline InferInputs for the TCP path (immutable, reused across requests), and shm output
+# read-back declarations.
 struct ModelSpec
     name::String
     model::KServeModel
-    input_name::String
-    dtype::DataType
-    per_item_dims::Vector{Int}
-    tcp_input::Any              # ModelInferRequest.InferInputTensor for the inline path
+    inputs::Vector{InputSpec}
+    tcp_inputs::Vector{Any}         # one ModelInferRequest.InferInputTensor per input (inline path)
     out_specs::Vector{OutputSpec}   # shm read-back declarations; empty = outputs stay inline
 end
 
@@ -98,14 +111,20 @@ function discover_models()
         try
             io = manifest_io_spec(manifest)
             isempty(io.input_order) && (@warn "skip: no inputs" model=name; continue)
-            tname = io.input_order[1]
-            tm = io.inputs[tname]
-            haskey(DTYPE, tm.datatype) || (@warn "skip: unmapped dtype" model=name dtype=tm.datatype; continue)
-            T = DTYPE[tm.datatype]
-            dims = per_item_dims(tm.shape)
-            arr = zeros(T, dims..., 1)                       # one item; Julia col-major, batch last
+            inputs = InputSpec[]
+            unmapped = false
+            for tname in io.input_order                      # ALL inputs, not just the first
+                tm = io.inputs[tname]
+                haskey(DTYPE, tm.datatype) || (unmapped = true; break)
+                # batch axis shows up as -1 in the metadata shape; absent => unbatched input
+                push!(inputs, InputSpec(tname, DTYPE[tm.datatype],
+                                        per_item_dims(tm.shape), any(==(-1), tm.shape)))
+            end
+            unmapped && (@warn "skip: unmapped dtype" model=name; continue)
+            tcp_inputs = Any[InferInput(inp.name, zeros(inp.dtype, _wire_dims(inp, 1)...))
+                             for inp in inputs]
             spec = ModelSpec(name, KServeModel(GATEWAY, name; max_batch_size = 1),
-                             tname, T, dims, InferInput(tname, arr), output_shm_specs(io))
+                             inputs, tcp_inputs, output_shm_specs(io))
         catch err
             @warn "skip: manifest_io_spec failed" model=name exception=err
             continue
@@ -115,19 +134,25 @@ function discover_models()
     return specs
 end
 
-# Minimal IO for the shared-memory path: one zero-filled item of a single model's input.
+# Minimal IO for the shared-memory path: one zero-filled item of every one of a model's inputs.
 struct DummyIO <: AbstractInferenceIO
     spec::ModelSpec
 end
 Base.length(::DummyIO) = 1
-ReactantServerClient.item_input_bytes(io::DummyIO) = sizeof(io.spec.dtype) * prod(io.spec.per_item_dims)
+# Per-item bytes summed across all inputs (each input's per-item size; the batch row, if any, is 1).
+ReactantServerClient.item_input_bytes(io::DummyIO) =
+    sum(sizeof(inp.dtype) * prod(_wire_dims(inp, 1)) for inp in io.spec.inputs)
 function ReactantServerClient.infer_encode_chunk!(io::DummyIO, r, slot)
     n = length(r)
-    nbytes = n * item_input_bytes(io)
-    sub = subslot(slot, nbytes)
-    fill!(pool_view(sub, UInt8, nbytes), 0x00)
-    # PoolInferInput shape is Julia column-major (per-item dims then batch last).
-    return [InferInput(io.spec.input_name, sub, Int[io.spec.per_item_dims..., n], io.spec.dtype)]
+    ins = InferInput[]
+    for inp in io.spec.inputs
+        wire = _wire_dims(inp, n)                          # Julia col-major; batch (if any) last
+        nbytes = sizeof(inp.dtype) * prod(wire)
+        sub = subslot(slot, nbytes)
+        fill!(pool_view(sub, UInt8, nbytes), 0x00)
+        push!(ins, InferInput(inp.name, sub, wire, inp.dtype))
+    end
+    return ins
 end
 ReactantServerClient.infer_decode_chunk!(::DummyIO, r, response) = nothing
 # Declaring outputs opts the shm path into shared-memory read-back (explicit-output mode): the
@@ -170,7 +195,7 @@ function fire(spec::ModelSpec, use_shm::Bool)
     if use_shm
         infer_async(spec.model, DummyIO(spec))
     else
-        infer_sync(spec.model, [spec.tcp_input])
+        infer_sync(spec.model, spec.tcp_inputs)
     end
     dt = Int(time_ns() - t0)
     atomic_add!(N_OK, 1)
