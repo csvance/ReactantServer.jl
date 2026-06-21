@@ -301,8 +301,10 @@ function main()
     specs = discover_models(grpc)
     isempty(specs) && (println("ERROR: no usable models discovered under $MODEL_REPO"); exit(2))
     println("discovered $(length(specs)) models; starting soak with $(nthreads()) threads")
+    flush(stdout)   # surface startup lines now; stdout to docker is block-buffered (see reporter)
 
     WARMUP && warmup(specs)
+    flush(stdout)
 
     deadline = time() + DURATION
     pick_shm(i) = TRANSPORT === :shm ? true : TRANSPORT === :mixed ? isodd(i) : false
@@ -333,6 +335,7 @@ function main()
         err_shown = false
         while time() < deadline
             sleep(REPORT_SEC)
+            try
             now = time()
             ok = N_OK[]; err = N_ERR[]
             d_ok = ok - last_ok
@@ -374,6 +377,11 @@ function main()
             end
             flush(stdout)   # piped stdout (docker logs) is block-buffered; flush so reports appear live
             last_ok = ok; last_t = now
+            catch e
+                # A single bad iteration (e.g. a transient scrape/format error) must never kill the
+                # reporter and masquerade as a silent soak — log it and keep reporting.
+                println("[reporter] error this window (continuing): ", sprint(showerror, e)); flush(stdout)
+            end
         end
     end
 
