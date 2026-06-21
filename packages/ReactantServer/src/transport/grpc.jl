@@ -58,11 +58,17 @@ const _GRPC_STATUS_NAME = Dict{Int,String}(
 _status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") :
                    e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
 
-# A request's effective absolute deadline (local time_ns()): the in-body KV timeout (carried through
-# the gateway's raw-byte forwarding, already converted to absolute at decode) takes precedence; a
-# direct client that set only grpc-timeout falls back to the gRPC context's parsed deadline.
-_effective_deadline(decoded_dl::Integer, grpc_dl::Integer) =
-    decoded_dl != 0 ? Int64(decoded_dl) : Int64(grpc_dl)
+# A request's effective absolute deadline (local time_ns()): the TIGHTEST of the in-body KV timeout
+# (carried through the gateway's raw-byte forwarding) and the grpc-timeout (which the gateway
+# recomputes per hop, so it reflects time already burned reaching this worker). Both are absolute
+# local times after decode; 0 means "not set" on that channel. Taking the min means a gateway that
+# decremented grpc-timeout for transit wins over a stale, never-decremented KV budget.
+function _effective_deadline(decoded_dl::Integer, grpc_dl::Integer)
+    a, b = Int64(decoded_dl), Int64(grpc_dl)
+    a == 0 && return b
+    b == 0 && return a
+    return min(a, b)
+end
 
 _not_found(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_NOT_FOUND, msg))
 _invalid(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_INVALID_ARGUMENT, msg))

@@ -10,6 +10,14 @@
 # unset, the worker has no gateway and meta sub-calls go in-process through the local scheduler.
 const LOOPBACK_ENV = "REACTANT_LOOPBACK_GRPC"
 
+# Concurrent-stream cap for the loopback handle all of a worker's meta sub-calls share. The gRPCClient
+# default (GRPC_MAX_STREAMS=16) is far too small here: a worker admits up to `max_concurrent_requests`
+# (default 64) metas, each issuing a sub-call, and the acquire of a stream slot (`take!(sem)`) is an
+# UNBOUNDED wait done before any deadline applies — so a saturated handle parks metas past their
+# deadline. Size it to the worker's inbound cap so the acquire effectively never blocks.
+const LOOPBACK_MAX_STREAMS_ENV = "REACTANT_LOOPBACK_MAX_STREAMS"
+_loopback_max_streams() = something(tryparse(Int, strip(get(ENV, LOOPBACK_MAX_STREAMS_ENV, ""))), 64)
+
 abstract type ModelCaller end
 
 # In-process caller: routes a sub-call straight through the local scheduler's `infer`. No gRPC, no
@@ -60,7 +68,7 @@ function GatewayCaller(url::AbstractString; deadline::Real=300,
     host, port = _split_loopback(url)
     # sticky=false: meta orchestrations run on the worker's default (compute) thread pool, so the
     # multi handle's driving tasks must be schedulable on whichever thread issues the call.
-    grpc = gRPCClient.gRPCCURL(; sticky=false)
+    grpc = gRPCClient.gRPCCURL(; sticky=false, max_streams=_loopback_max_streams())
     client = GRPCInferenceService_ModelInfer_Client(host, port; grpc=grpc, deadline=deadline,
         TRequest=ModelInferRequest, TResponse=ModelInferResponse,
         max_send_message_length=max_msg_bytes, max_recieve_message_length=max_msg_bytes)
@@ -107,17 +115,61 @@ end
 
 # `deadline_ns` is an absolute local `time_ns()` deadline (0 = none). The sub-call crosses a process
 # boundary (loopback gRPC, possibly via the gateway to another worker), so the absolute deadline is
-# converted to a RELATIVE remaining budget and sent as the request-level timeout KV param; the
-# destination worker converts it back to its own local absolute deadline. A non-positive remaining
-# budget is unreachable here (the MetaCall bails before calling), but is encoded as "no deadline"
-# (empty params) defensively rather than as an already-expired one.
+# carried two ways, both as a RELATIVE remaining budget recomputed here: (1) the request-level timeout
+# KV param (rides through the gateway's raw-byte forwarding) and (2) the per-call gRPC deadline (the
+# gateway decrements this grpc-timeout further for transit). The destination worker honors the
+# tightest. We also bound the WHOLE sub-call by the budget locally (`_await_within`) so the meta never
+# parks past its deadline on the one wait a deadline cannot reach: the stream-semaphore acquire.
 function call_model(c::GatewayCaller, name::AbstractString, inputs::Vector{NamedTensor};
                     requested_outputs::Vector{String}=String[], deadline_ns::Integer=0)
-    budget = deadline_ns == 0 ? 0 : Int64(deadline_ns) - Int64(time_ns())
-    params = deadline_params(budget)
-    req = _build_subcall_request(c.pool, name, inputs, requested_outputs, params)
-    resp = gRPCClient.grpc_sync_request(c.client, req)
-    return decode_infer_response(resp)
+    if deadline_ns == 0
+        req = _build_subcall_request(c.pool, name, inputs, requested_outputs, deadline_params(0))
+        return decode_infer_response(gRPCClient.grpc_sync_request(c.client, req))
+    end
+    budget_ns = Int64(deadline_ns) - Int64(time_ns())
+    budget_ns <= 0 && throw(DeadlineExceeded(String(name)))
+    req = _build_subcall_request(c.pool, name, inputs, requested_outputs, deadline_params(budget_ns))
+    return decode_infer_response(_await_within(c.client, req, budget_ns, String(name)))
+end
+
+# Issue one sub-call bounded by `budget_s`. The request runs on its own task with a per-call gRPC
+# deadline of `budget_s` (so curl times out, and the grpc-timeout it sends carries the budget
+# downstream). A timer races it; on expiry we interrupt the request task and raise DeadlineExceeded,
+# so the meta stops waiting and frees its worker handler slot at the deadline instead of parking. The
+# interrupt unwinds a task stuck in the stream-semaphore acquire (`take!(sem)`, which holds no slot);
+# a task already past the acquire keeps its in-flight curl request, which the `budget_s` curl timeout
+# then completes, releasing the slot in gRPCClient's own cleanup. `out` is buffered so neither the
+# request task nor the timer task can block on `put!` (and an interrupted task's catch still fits).
+function _await_within(client, req, budget_ns::Int64, name::AbstractString)
+    budget_s = budget_ns / 1e9
+    # Per-call gRPC deadline in WHOLE SECONDS (grpc_timeout_header_val only encodes integer seconds
+    # cleanly; a fractional value becomes a >8-digit nanosecond string the receiver rejects). Ceil so
+    # it is never 0 (which disables curl's timeout) and stays >= the precise timer below, so the timer
+    # is what actually bounds us at the true budget.
+    deadline_s = max(1, cld(budget_ns, 1_000_000_000))
+    out = Channel{Tuple{Symbol,Any}}(2)
+    task = @async begin
+        try
+            r = gRPCClient.grpc_async_request(client, req; deadline=deadline_s)
+            put!(out, (:ok, gRPCClient.grpc_async_await(client, r)))
+        catch e
+            put!(out, (:err, e))
+        end
+    end
+    timer = Timer(budget_s)
+    @async (try; wait(timer); put!(out, (:timeout, nothing)); catch; end)
+    tag, val = take!(out)
+    close(timer)
+    if tag === :timeout
+        try
+            istaskdone(task) || schedule(task, InterruptException(); error=true)
+        catch
+        end
+        throw(DeadlineExceeded(name))
+    elseif tag === :err
+        throw(val)
+    end
+    return val
 end
 
 """
