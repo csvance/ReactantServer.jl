@@ -107,11 +107,11 @@ const _EInf = ReactantServer.inference
     end
 end
 
-# A meta model served alongside its backbone, driven over the real gRPC path. With no loopback
-# gateway configured the worker uses a LocalCaller, so the meta orchestration's call to "scale4"
-# re-enters the same scheduler in-process. This exercises the full wire path the unit tests skip:
-# decode -> run_meta -> sub-call -> encode.
-@testset "meta model end-to-end (CPU, LocalCaller)" begin
+# A meta model served alongside its backbone, driven over the real gRPC path. The meta is a
+# scheduled unit: the dispatch loop runs its orchestration inline and its call to "scale4" invokes
+# that sub-model's executable directly in-process. This exercises the full wire path the unit tests
+# skip: decode -> queue -> execute_meta! -> in-process sub-call -> encode.
+@testset "meta model end-to-end (CPU, in-process)" begin
     mktempdir() do root
         # Backbone: y = x .* 2.
         write_bundle(root, "scale4";
@@ -160,10 +160,7 @@ end
             ReactantServer.SchedulerConfig(30.0, 64, 30.0),
             ReactantServer.EndpointsConfig("127.0.0.1", port))
 
-        # Ensure no stale loopback endpoint leaks in, so build_caller picks LocalCaller.
-        srv = withenv(ReactantServer.LOOPBACK_ENV => nothing) do
-            ReactantServer.serve(cfg; backend=ReactantServer.ReactantBackend(), blocking=false)
-        end
+        srv = ReactantServer.serve(cfg; backend=ReactantServer.ReactantBackend(), blocking=false)
         sleep(0.3)
         try
             # The meta model reports ready and is discoverable, exactly like a regular model.

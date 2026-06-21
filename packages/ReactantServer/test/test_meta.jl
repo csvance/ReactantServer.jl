@@ -1,7 +1,8 @@
 # Meta models: a Julia orchestration (a bundle's model.jl that calls register_meta_model) chains
-# other models with data-dependent logic. These tests exercise the worker-mode path (LocalCaller,
-# no gateway): manifest/bundle loading, the injected caller, the declared-call guard, and the
-# cross-bundle recursion check. The multi-worker GatewayCaller path is covered by the e2e suite.
+# other models with data-dependent logic. A meta is a scheduled unit that runs its orchestration
+# inline, calling sub-models' executables directly in-process via an InlineCaller (no queue re-entry,
+# no gateway). These tests exercise that path: manifest/bundle loading, the injected caller, the
+# declared-call guard, the deadline bail, and the cross-bundle recursion check.
 
 const _RS = ReactantServer
 
@@ -19,7 +20,8 @@ _meta_manifest(name, calls) = _RS.parse_manifest(Dict{String,Any}(
     "client_inputs" => [Dict("name" => "x", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))],
     "client_outputs" => [Dict("name" => "OUT", "dtype" => "f32", "shape" => "c", "dims" => Dict("c" => 4))]))
 
-# A scheduler hosting the "scale" backbone, plus a LocalCaller over it.
+# A registry hosting the "scale" backbone, a started scheduler over it (for the queue/deadline path),
+# and an InlineCaller a meta uses to run sub-models in-process.
 function _meta_local_caller()
     backend = _RS.MockBackend()
     pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
@@ -28,7 +30,7 @@ function _meta_local_caller()
         "", nothing, _meta_scale_model(), nothing, identity, identity)
     sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
     _RS.start!(sched)
-    return sched, _RS.LocalCaller(sched)
+    return sched, _RS.InlineCaller(backend, pool, reg, nothing, nothing)
 end
 
 @testset "meta manifest parse + validate" begin
@@ -53,7 +55,7 @@ end
     end
 end
 
-@testset "meta model runs in worker mode via LocalCaller" begin
+@testset "meta model runs its sub-models in-process via InlineCaller" begin
     sched, caller = _meta_local_caller()
 
     # The orchestration calls the backbone (x .* 2), then branches on the data: scale again when the
@@ -186,10 +188,29 @@ end
     @test_throws _RS.BundleError _RS.load_bundles([root])
 end
 
-@testset "build_caller defaults to LocalCaller with no loopback configured" begin
-    sched, _ = _meta_local_caller()
-    withenv(_RS.LOOPBACK_ENV => nothing) do
-        @test _RS.build_caller(sched) isa _RS.LocalCaller
+@testset "meta runs as a scheduled unit via the dispatch loop" begin
+    # End-to-end through the scheduler: register the backbone and a meta, start the loop, and submit
+    # the meta via `infer`. The loop selects the meta and runs it inline (execute_meta!), driving the
+    # backbone in-process. Confirms a meta is dispatched like any unit and returns its outputs.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    reg.by_name["scale"] = _RS.ModelEntry("scale", _trivial_manifest("scale"), Dict{Int,Vector{UInt8}}(),
+        "", nothing, _meta_scale_model(), nothing, identity, identity)
+    run = (inputs, call) -> [_RS.NamedTensor("OUT", call("scale", inputs)[1].data .+ 1)]
+    reg.meta["det"] = _RS.MetaEntry("det", _meta_manifest("det", ["scale"]), ["scale"], run)
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    _RS.start!(sched)
+    try
+        out = _RS.infer(sched, _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]))
+        @test out isa Vector{_RS.NamedTensor}
+        @test out[1].name == "OUT"
+        @test out[1].data == Float32[3, 5, 7, 9]   # (x .* 2) .+ 1
+        # A past-deadline meta request is dropped at admission without running the backbone.
+        past = _RS.InferRequest("det", String[], [_RS.NamedTensor("x", Float32[1, 2, 3, 4])],
+                                Int64(time_ns()) - Int64(1_000_000))
+        @test_throws _RS.DeadlineExceeded _RS.infer(sched, past)
+    finally
+        _RS.shutdown!(sched)
     end
-    _RS.shutdown!(sched)
 end

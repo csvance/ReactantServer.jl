@@ -57,12 +57,13 @@ mutable struct Scheduler
     running::Bool
     task::Union{Task,Nothing}
     weight_cache::Union{WeightCache,Nothing}   # on-demand weight residency, or nothing when disabled
+    scratch_pool::Union{BufferPool,Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(registry, backend, pool, cfg,
-                     Threads.Condition(), false, nothing, nothing, ControlCommand[])
+                     Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[])
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -71,6 +72,13 @@ struct Dispatch
     entry::ModelEntry
     size::Int
     taken::Vector{QueuedRequest}
+end
+
+# A meta selected to run. A meta is never coalesced, so it carries exactly one request; the dispatch
+# loop runs its orchestration inline (holding the GPU exclusively) via `execute_meta!`.
+struct MetaDispatch
+    entry::MetaEntry
+    qr::QueuedRequest
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -231,12 +239,25 @@ end
 _schedulable(entry::ModelEntry) =
     entry.sched !== nothing && entry.executable !== nothing && !isempty(entry.sched.queue)
 
-_has_queued(s::Scheduler) = any(_schedulable, values(s.registry.by_name))
+# A meta is schedulable when its sched is prepared and it has queued work. It owns no executable;
+# its sub-models' executables are invoked in-process when it runs (see `execute_meta!`).
+_schedulable(entry::MetaEntry) = entry.sched !== nothing && !isempty(entry.sched.queue)
+
+# Both passes iterate a concrete dict, so each `any` call resolves to one `_schedulable` method.
+_has_queued(s::Scheduler) =
+    any(_schedulable, values(s.registry.by_name)) || any(_schedulable, values(s.registry.meta))
 
 function _finalize(entry::ModelEntry, plan)
     B, taken = plan
     deleteat!(entry.sched.queue, 1:length(taken))     # taken are the front entries, in order
     return Dispatch(entry, B, taken)
+end
+
+# A meta dispatches its single front request (never coalesced).
+function _finalize_meta(entry::MetaEntry)
+    qr = entry.sched.queue[1]
+    deleteat!(entry.sched.queue, 1)
+    return MetaDispatch(entry, qr)
 end
 
 # Select the next dispatch under the lock. Dispatches on the configured discipline; both
@@ -249,9 +270,11 @@ function select_dispatch!(s::Scheduler, now::Float64)
 end
 
 # FIFO: serve the model whose oldest queued request is the oldest overall, then coalesce its
-# queue. Ties break by model name for determinism.
+# queue. Metas compete in the same ordering (a separate, monomorphic pass over `registry.meta`), so
+# an old meta request beats a newer regular one. Ties break by model name for determinism. The only
+# `Union` touch is `chosen.name` in the tiebreak — once per better candidate, not in the arithmetic.
 function _select_fifo!(s::Scheduler)
-    chosen = nothing
+    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
     best_t = Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
@@ -260,7 +283,15 @@ function _select_fifo!(s::Scheduler)
             chosen, best_t = entry, t
         end
     end
+    for entry in values(s.registry.meta)
+        _schedulable(entry) || continue
+        t = entry.sched.queue[1].enqueued_at
+        if chosen === nothing || t < best_t || (t == best_t && entry.name < chosen.name)
+            chosen, best_t = entry, t
+        end
+    end
     chosen === nothing && return nothing
+    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, plan_batch(chosen, chosen.sched))
 end
 
@@ -284,7 +315,7 @@ end
 # a request deep behind the batch size advances over successive dispatches of its (preferentially
 # selected) model rather than jumping the batch; that keeps coalescing semantics intact.
 function _select_edf!(s::Scheduler)
-    chosen = nothing
+    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
     best_dl = typemax(Int64)
     best_oldest = Inf
     for entry in values(s.registry.by_name)
@@ -298,20 +329,39 @@ function _select_edf!(s::Scheduler)
             chosen, best_dl, best_oldest = entry, dl, oldest
         end
     end
+    for entry in values(s.registry.meta)
+        _schedulable(entry) || continue
+        st = entry.sched
+        dl = _queue_min_deadline(st)
+        oldest = st.queue[1].enqueued_at
+        if chosen === nothing || dl < best_dl ||
+           (dl == best_dl && oldest < best_oldest) ||
+           (dl == best_dl && oldest == best_oldest && entry.name < chosen.name)
+            chosen, best_dl, best_oldest = entry, dl, oldest
+        end
+    end
     chosen === nothing && return nothing
+    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, plan_batch(chosen, chosen.sched))
 end
 
 # Fair: deficit-weighted, cost-aware priority. Decay every EMA to now before reading, then normalize.
+# Metas participate via a separate monomorphic pass; their cost uses batch key 0 (non-coalescable),
+# seeded from the measured meta runtime (recorded under key 0 by `execute_meta!`) or the default.
 function _select_fair!(s::Scheduler, now::Float64)
     for entry in values(s.registry.by_name)
         entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
     end
-    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
-    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0)
+    for entry in values(s.registry.meta)
+        entry.sched === nothing || _decay_ema!(entry.sched, s.cfg.ema_halflife_seconds, now)
+    end
+    total_ema = sum(e.sched.recent_compute_ema for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0) +
+                sum(e.sched.recent_compute_ema for e in values(s.registry.meta) if e.sched !== nothing; init=0.0)
+    total_w = sum(e.sched.weight for e in values(s.registry.by_name) if e.sched !== nothing; init=0.0) +
+              sum(e.sched.weight for e in values(s.registry.meta) if e.sched !== nothing; init=0.0)
 
-    chosen = nothing
-    chosen_plan = nothing
+    chosen = nothing            # Union{ModelEntry,MetaEntry,Nothing}
+    chosen_plan = nothing       # the regular batch plan; nothing for a meta
     best_p = -Inf
     for entry in values(s.registry.by_name)
         _schedulable(entry) || continue
@@ -330,7 +380,20 @@ function _select_fair!(s::Scheduler, now::Float64)
             chosen, chosen_plan, best_p = entry, plan, p
         end
     end
+    for entry in values(s.registry.meta)
+        _schedulable(entry) || continue
+        st = entry.sched
+        share = total_w == 0 ? 0.0 : st.weight / total_w
+        nema = total_ema == 0 ? 0.0 : st.recent_compute_ema / total_ema
+        p = priority(share, nema, s.cfg.recency_penalty_cap, effective_cost(st, 0, s.cfg.coalescing_discount))
+        if chosen === nothing || p > best_p ||
+           (p == best_p && st.queue[1].enqueued_at < chosen.sched.queue[1].enqueued_at) ||
+           (p == best_p && st.queue[1].enqueued_at == chosen.sched.queue[1].enqueued_at && entry.name < chosen.name)
+            chosen, chosen_plan, best_p = entry, nothing, p
+        end
+    end
     chosen === nothing && return nothing
+    chosen isa MetaEntry && return _finalize_meta(chosen)
     return _finalize(chosen, chosen_plan)
 end
 
@@ -482,13 +545,53 @@ function execute_and_record!(s::Scheduler, d::Dispatch)
     return nothing
 end
 
+# Run a meta dispatch inline on the dispatch loop, holding the GPU exclusively for the whole
+# orchestration. The injected `InlineCaller` invokes each declared sub-model's executable directly
+# in-process (preprocess -> acquire! -> run_model -> postprocess), with no queue re-entry and no
+# loopback. Sub-model weights load on demand on this (the dispatch) thread, the sole residency
+# mutator, so it is safe. The meta's wall time is recorded under batch key 0 (it is non-coalescable),
+# which also seeds its FAIR cost estimate. A thrown sub-call error or `DeadlineExceeded` is delivered
+# to the reply, never escaping to wedge the loop.
+function execute_meta!(s::Scheduler, d::MetaDispatch)
+    entry, qr = d.entry, d.qr
+    st = entry.sched
+    # Deadline admission (base check only; a meta has no per-batch-size cost for an EDF laxity margin).
+    if qr.req.deadline_ns != 0 && Int64(time_ns()) >= qr.req.deadline_ns
+        put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+        return nothing
+    end
+    caller = InlineCaller(s.backend, s.pool, s.registry, s.weight_cache, s.scratch_pool)
+    t0 = time()
+    try
+        out = run_meta(entry, caller, qr.req.inputs; deadline_ns=qr.req.deadline_ns)
+        compute_time = time() - t0
+        lock(s.cond) do
+            now = time()
+            _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
+            st.recent_compute_ema += compute_time
+            _update_cost!(st, 0, compute_time, s.cfg.cost_ema_alpha)
+            st.dispatch_count += 1
+            st.requests_served += 1
+            st.total_compute += compute_time
+            push!(st.wait_samples, now - qr.enqueued_at)
+            while length(st.wait_samples) > _WAIT_SAMPLE_CAP
+                popfirst!(st.wait_samples)
+            end
+        end
+        put!(qr.reply, out)
+    catch e
+        put!(qr.reply, e)
+    end
+    return nothing
+end
+
 # ---------------------------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------------------------
 
-# Initialize an entry's scheduling state from the config (or defaults). The entry then has both
-# `executable` (compiled) and `sched` set, the prepared invariant the dispatch loop relies on.
-function init_sched_state!(s::Scheduler, entry::ModelEntry, now::Float64)
+# Initialize an entry's scheduling state from the config (or defaults). Works for a regular model
+# (which also needs `executable` compiled) and for a meta (which has no executable but is dispatched).
+function init_sched_state!(s::Scheduler, entry::AbstractDispatchEntry, now::Float64)
     mc = get(s.cfg.models, entry.name, ModelSchedConfig(1.0))
     entry.sched = ModelSchedState(entry.name, mc, now)
     return entry
@@ -499,6 +602,9 @@ end
 function start!(s::Scheduler)
     now = time()
     for entry in values(s.registry.by_name)
+        init_sched_state!(s, entry, now)
+    end
+    for entry in values(s.registry.meta)   # metas are dispatched too, so they get sched state as well
         init_sched_state!(s, entry, now)
     end
     s.weight_cache === nothing || preload_pinned!(s.weight_cache, s.registry)
@@ -534,6 +640,13 @@ end
 function _reject_pending_locked!(s::Scheduler)
     err = ErrorException("server is shutting down")
     for entry in values(s.registry.by_name)
+        entry.sched === nothing && continue
+        for qr in entry.sched.queue
+            put!(qr.reply, err)
+        end
+        empty!(entry.sched.queue)
+    end
+    for entry in values(s.registry.meta)
         entry.sched === nothing && continue
         for qr in entry.sched.queue
             put!(qr.reply, err)
@@ -607,7 +720,9 @@ function submit!(s::Scheduler, qr::QueuedRequest)
             put!(qr.reply, ErrorException("server is shutting down"))
             return
         end
-        entry = get(s.registry.by_name, qr.req.model_name, nothing)
+        # Target may be a regular model or a meta (both carry a queue once prepared).
+        reg = get(s.registry.by_name, qr.req.model_name, nothing)
+        entry = reg === nothing ? get(s.registry.meta, qr.req.model_name, nothing) : reg
         if entry === nothing || entry.sched === nothing
             put!(qr.reply, ErrorException("unknown model: $(qr.req.model_name)"))
             return
@@ -651,7 +766,13 @@ function dispatch_loop(s::Scheduler)
             end
         end
         (isempty(cmds) && chosen === nothing) && break
-        chosen === nothing || execute_and_record!(s, chosen)
+        # One isa discriminates the selection union; a meta runs its whole orchestration inline here,
+        # holding the GPU exclusively until it returns (no other dispatch or control command runs).
+        if chosen isa MetaDispatch
+            execute_meta!(s, chosen)
+        elseif chosen !== nothing
+            execute_and_record!(s, chosen)
+        end
     end
     return nothing
 end
@@ -684,12 +805,31 @@ until applied. Raises on an unknown model or in self-managed mode.
 """
 function set_residency!(s::Scheduler, name::AbstractString, target::ResidencyState)
     return _run_control(s, function (sch)
-        entry = get(sch.registry.by_name, String(name), nothing)
-        entry === nothing && throw(ErrorException("unknown model: $name"))
         sch.weight_cache === nothing &&
             throw(ErrorException("residency control requires the on-demand weight cache (set runtime.weight_cache_bytes > 0)"))
         sch.weight_cache.mode == EXTERNALLY_MANAGED ||
             throw(ErrorException("worker is self-managed; residency is not externally controllable"))
+        nm = String(name)
+        # A meta owns no weights: its residency is its sub-models' residency (the group is the unit).
+        # Pinning a meta pins each sub. When unpinning, leave a sub resident if another meta also
+        # declares it (conservative — avoids prematurely unpinning a shared stage that a sibling meta
+        # still needs; the cost is a little extra resident memory, never a wrong eviction).
+        meta = get(sch.registry.meta, nm, nothing)
+        if meta !== nothing
+            last = target
+            for sub in meta.calls
+                e = get(sch.registry.by_name, sub, nothing)
+                e === nothing && continue
+                if target == UNPINNED && any(other.name != nm && sub in other.calls
+                                             for other in values(sch.registry.meta))
+                    continue
+                end
+                last = set_residency_state!(sch.weight_cache, e, target)
+            end
+            return last
+        end
+        entry = get(sch.registry.by_name, nm, nothing)
+        entry === nothing && throw(ErrorException("unknown model: $name"))
         return set_residency_state!(sch.weight_cache, entry, target)
     end)
 end
@@ -822,6 +962,7 @@ scheduler lock rather than through the control queue. Returns the model name.
 """
 function put_meta!(s::Scheduler, entry::MetaEntry)
     lock(s.cond) do
+        init_sched_state!(s, entry, time())   # give it a queue + sched so the dispatch loop can run it
         s.registry.meta[entry.name] = entry
     end
     return entry.name
@@ -834,7 +975,13 @@ Remove a meta model from the registry (the dynamic watcher's unload path for met
 """
 function remove_meta!(s::Scheduler, name::AbstractString)
     lock(s.cond) do
-        delete!(s.registry.meta, String(name))
+        e = pop!(s.registry.meta, String(name), nothing)
+        if e !== nothing && e.sched !== nothing
+            for qr in e.sched.queue       # unblock any callers waiting on an in-flight meta request
+                put!(qr.reply, ErrorException("model '$name' was unloaded"))
+            end
+            empty!(e.sched.queue)
+        end
     end
     return nothing
 end
@@ -854,8 +1001,19 @@ request is only enqueued (made visible to the loop) after preprocess returns.
 """
 function infer(s::Scheduler, req::InferRequest)
     entry = get(s.registry.by_name, req.model_name, nothing)
-    (entry === nothing || entry.sched === nothing) &&
-        throw(ErrorException("unknown model: $(req.model_name)"))
+    if entry === nothing
+        # A meta is queued as-is (no pre/post hook; its `run` is the whole computation). The dispatch
+        # loop runs it inline via `execute_meta!`, which returns its assembled outputs.
+        meta = get(s.registry.meta, req.model_name, nothing)
+        (meta === nothing || meta.sched === nothing) &&
+            throw(ErrorException("unknown model: $(req.model_name)"))
+        qr = QueuedRequest(req)            # prepared defaults to req.inputs; unused on the meta path
+        submit!(s, qr)
+        raw = take!(qr.reply)
+        raw isa Exception && throw(raw)
+        return raw
+    end
+    entry.sched === nothing && throw(ErrorException("unknown model: $(req.model_name)"))
     # preprocess/postprocess come from a bundle's model.jl, defined in a newer world age;
     # invokelatest crosses that boundary (harmless for identity).
     prepared = Base.invokelatest(entry.preprocess, req.inputs)
@@ -913,32 +1071,67 @@ function _effective_max_batch(entry::ModelEntry)
     return cap === nothing ? largest : min(Int(cap), largest)
 end
 
+# A meta's control-plane status: its OWN serving counters and queue, but a weight footprint and
+# residency AGGREGATED over its sub-models (the meta owns no weights). The gateway packs this as one
+# unit; internal sub-models are not reported separately. A meta is non-coalescable (max batch 0).
+function _meta_group_status(s::Scheduler, meta::MetaEntry)
+    nbytes = 0
+    dev = true
+    host = true
+    floor = PINNED_DEVICE        # least-resident state across subs; start at the most-resident
+    any_sub = false
+    for sub in meta.calls
+        e = get(s.registry.by_name, sub, nothing)
+        (e === nothing || e.executable === nothing) && continue
+        any_sub = true
+        nbytes += e.executable.nbytes
+        dev &= (e.executable.weights !== nothing)
+        host &= (e.executable.host_weights !== nothing)
+        Integer(e.executable.state) < Integer(floor) && (floor = e.executable.state)
+    end
+    any_sub || (dev = false; host = false; floor = UNPINNED)   # compute-only meta: no weights
+    return (state = floor, device_resident = dev, host_resident = host, weight_nbytes = nbytes,
+            weight = meta.sched.weight, queue_depth = length(meta.sched.queue),
+            total_compute = meta.sched.total_compute, requests_served = meta.sched.requests_served,
+            dispatch_count = meta.sched.dispatch_count, max_batch_size = 0)
+end
+
 """
     control_status(scheduler) -> NamedTuple
 
 A control-plane snapshot of the worker: its residency mode and scheduling discipline, plus a
-per-model view of residency state, host/device residency, footprint, weight, and queue depth.
+per-model view. A meta is reported as a single model whose footprint is the sum of its sub-models'
+weights; the internal sub-models are folded into it and not reported on their own, so the gateway
+packs and routes the group as one unit and never sees the stages.
 """
 function control_status(s::Scheduler)
     lock(s.cond) do
         mode = s.weight_cache === nothing ? SELF_MANAGED : s.weight_cache.mode
-        models = Dict(entry.name => (
-            state = entry.executable.state,
-            device_resident = entry.executable.weights !== nothing,
-            host_resident = entry.executable.host_weights !== nothing,
-            weight_nbytes = entry.executable.nbytes,
-            weight = entry.sched.weight,
-            queue_depth = length(entry.sched.queue),
-            # Cumulative serving counters: a gateway derives true per-request compute cost from
-            # deltas of total_compute / requests_served between polls (lpt_packing scheduling).
-            total_compute = entry.sched.total_compute,
-            requests_served = entry.sched.requests_served,
-            dispatch_count = entry.sched.dispatch_count,
-            # Effective max batch the worker coalesces to: the largest compiled batch shape
-            # (positive exec keys; key 0 is the unbatched module), capped by the configured
-            # max_batch_size. Routing metadata for the gateway's coalescing-aware placement.
-            max_batch_size = _effective_max_batch(entry),
-        ) for entry in values(s.registry.by_name) if entry.sched !== nothing && entry.executable !== nothing)
+        subs = internal_submodels(s.registry)
+        models = Dict{String,Any}()
+        for entry in values(s.registry.by_name)
+            (entry.sched === nothing || entry.executable === nothing) && continue
+            entry.name in subs && continue   # internal stage of a meta: folded into the meta, hidden here
+            models[entry.name] = (
+                state = entry.executable.state,
+                device_resident = entry.executable.weights !== nothing,
+                host_resident = entry.executable.host_weights !== nothing,
+                weight_nbytes = entry.executable.nbytes,
+                weight = entry.sched.weight,
+                queue_depth = length(entry.sched.queue),
+                # Cumulative serving counters: a gateway derives true per-request compute cost from
+                # deltas of total_compute / requests_served between polls (lpt_packing scheduling).
+                total_compute = entry.sched.total_compute,
+                requests_served = entry.sched.requests_served,
+                dispatch_count = entry.sched.dispatch_count,
+                # Effective max batch the worker coalesces to, capped by max_batch_size.
+                max_batch_size = _effective_max_batch(entry),
+            )
+        end
+        for meta in values(s.registry.meta)
+            meta.sched === nothing && continue
+            models[meta.name] = _meta_group_status(s, meta)
+        end
         # The on-demand weight budget is the memory capacity a gateway packs weight footprints
         # against; 0 (cache disabled, all weights resident) means memory is not a constraint.
         cache_max = s.weight_cache === nothing ? 0 : s.weight_cache.max_bytes
