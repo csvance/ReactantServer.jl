@@ -102,14 +102,15 @@ mutable struct Scheduler
     scratch_pool::Union{BufferPool,Nothing}    # local reuse pool for meta intermediates (plain Memory); nothing disables
     control::Vector{ControlCommand}            # pending control commands, drained by the dispatch loop
     meta_gate::MetaGate                        # admits one meta orchestration at a time (capacity configurable)
-    committed::Union{QueuedRequest,Nothing}    # an in-flight meta's continuation sub-call awaiting the next GPU slot;
-                                               # selected ahead of the discipline scan. At most one (one meta at a time).
+    committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
+                                               # dispatched ahead of the discipline scan. One entry per in-flight meta, so
+                                               # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(registry, backend, pool, cfg,
                      Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-                     MetaGate(1), nothing)
+                     MetaGate(1), QueuedRequest[])
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -296,14 +297,17 @@ end
 # the configured discipline; each discipline coalesces the chosen model's queue via `plan_batch`.
 # Returns a Dispatch or nothing if nothing is queued.
 function select_dispatch!(s::Scheduler, now::Float64)
-    if s.committed !== nothing
-        qr = s.committed
-        s.committed = nothing
-        # The committed request was pushed to the front of its sub-model's queue. Dispatch that model
-        # now (plan_batch draws from the front, so the committed request leads the batch). If the model
-        # is gone or already drained, fall through to a normal selection.
+    # In-flight metas' committed sub-calls jump ahead of the discipline scan, one per in-flight meta (so
+    # at most REACTANT_META_CONCURRENCY of them). Each was pushed to the front of its sub-model's queue,
+    # so plan_batch draws it (leading the batch). Pop in arrival order; skip a stale entry whose request
+    # is no longer queued (already coalesced/dispatched) or whose model is gone.
+    while !isempty(s.committed)
+        qr = popfirst!(s.committed)
         entry = get(s.registry.by_name, qr.req.model_name, nothing)
-        entry !== nothing && _schedulable(entry) && return _finalize(entry, plan_batch(entry, entry.sched))
+        (entry === nothing || !_schedulable(entry)) && continue
+        # `===` does not curry (it is a builtin, not a Fix2), so test identity with an explicit closure.
+        any(x -> x === qr, entry.sched.queue) || continue
+        return _finalize(entry, plan_batch(entry, entry.sched))
     end
     s.cfg.discipline == FIFO && return _select_fifo!(s)
     s.cfg.discipline == EDF && return _select_edf!(s)
@@ -658,6 +662,7 @@ function _reject_pending_locked!(s::Scheduler)
         end
         empty!(entry.sched.queue)
     end
+    empty!(s.committed)   # references into the (now drained) model queues; clear the stale priority list
     for c in s.control
         put!(c.reply, err)
     end
@@ -738,10 +743,11 @@ function submit!(s::Scheduler, qr::QueuedRequest)
         end
         if qr.committed
             # An in-flight meta's continuation jumps the line: push to the front of its sub-model's
-            # queue and flag it so `select_dispatch!` dispatches this model next, ahead of the
-            # discipline scan. Only one meta runs at a time, so at most one committed request exists.
+            # queue and record it so `select_dispatch!` dispatches this model ahead of the discipline
+            # scan. One such request per in-flight meta (sub-models are meta-exclusive, so distinct metas
+            # never contend for the same sub-model's front); the gate bounds the count to the concurrency.
             pushfirst!(entry.sched.queue, qr)
-            s.committed = qr
+            push!(s.committed, qr)
         else
             push!(entry.sched.queue, qr)
         end

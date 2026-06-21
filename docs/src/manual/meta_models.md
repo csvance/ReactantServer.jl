@@ -73,9 +73,12 @@ Two rules shape how a meta shares the GPU with everything else on the worker:
   must be sized for that many concurrent metas. A **compute-only** meta (empty `calls`, below) issues no
   sub-calls and bypasses the gate entirely, so a heavy pure-Julia meta never holds a permit a GPU meta needs.
 - **In-flight sub-calls jump the line.** Once a meta holds the gate, each of its GPU stages is
-  dispatched ahead of the queued regular work rather than waiting behind it. Because only one meta is
-  ever in flight and it runs its stages one at a time, there is at most one such priority sub-call at
-  any moment, so a regular model is preempted by at most one meta stage at a time.
+  dispatched ahead of the queued regular work rather than waiting behind it. The number that can cut the
+  line is tied to the gate: each in-flight meta contributes at most one pending sub-call, so the
+  committed set is bounded by `REACTANT_META_CONCURRENCY`. At the default of 1 exactly one meta cuts the
+  line and the behavior is fully deterministic; raising the gate lets that many metas cut the line
+  symmetrically (no contention for a single privileged slot), so the one knob sets both how many metas
+  run and how many are prioritized, a single dial for how strongly to favor meta completion.
 
 ```mermaid
 flowchart TD

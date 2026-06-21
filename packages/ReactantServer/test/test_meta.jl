@@ -296,3 +296,34 @@ end
         _RS.shutdown!(sched)
     end
 end
+
+@testset "committed sub-calls track the gate (each in-flight meta cuts the line)" begin
+    # The committed set is sized to the gate: with two metas in flight, both their sub-calls are
+    # committed and both cut the line (no single-slot overwrite). Drive selection by hand (loop not
+    # started) so the ordering is deterministic.
+    backend = _RS.MockBackend()
+    pool = _RS.MemoryPool(backend, _RS.MockClient(), _RS.MockDevice(0), "mock", nothing)
+    reg = _RS.ModelRegistry()
+    for nm in ("subA", "subB")
+        reg.by_name[nm] = _RS.ModelEntry(nm, _trivial_manifest(nm), Dict{Int,Vector{UInt8}}(),
+            "", nothing, _meta_scale_model(), nothing, identity, identity)
+    end
+    sched = _RS.Scheduler(reg, backend, pool, _RS.SchedulerConfig(30.0, 64, 30.0))
+    now = time()
+    for e in values(reg.by_name)
+        _RS.init_sched_state!(sched, e, now)
+    end
+    sched.running = true     # allow submit!; the dispatch loop is NOT started, so we select by hand
+    x = [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
+    qrA = _RS.QueuedRequest(_RS.InferRequest("subA", String[], x); committed=true)
+    qrB = _RS.QueuedRequest(_RS.InferRequest("subB", String[], x); committed=true)
+    _RS.submit!(sched, qrA)
+    _RS.submit!(sched, qrB)
+    @test length(sched.committed) == 2          # both retained; no single-slot overwrite
+    d1 = _RS.select_dispatch!(sched, time())
+    d2 = _RS.select_dispatch!(sched, time())
+    @test d1 isa _RS.Dispatch && d2 isa _RS.Dispatch
+    @test Set([d1.entry.name, d2.entry.name]) == Set(["subA", "subB"])   # both jumped the line
+    @test isempty(sched.committed)
+    @test _RS.select_dispatch!(sched, time()) === nothing                # nothing left to dispatch
+end
