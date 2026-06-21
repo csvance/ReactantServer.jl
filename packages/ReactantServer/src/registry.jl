@@ -42,7 +42,8 @@ const _CURRENT_META_REGISTRATION = Ref{Union{MetaRegistration,Nothing}}(nothing)
 
 Called from a meta bundle's model.jl to register the orchestration function. `run` has the form
 `run(inputs::Vector{NamedTensor}, call) -> Vector{NamedTensor}`, where `call(model_name, inputs)`
-invokes another model (routed to the gateway in multi-worker mode, or the local worker otherwise).
+invokes another model. The meta runs as a scheduled unit holding the GPU exclusively, and `call`
+invokes the sub-model's compiled executable directly in-process (no queue re-entry, no gateway hop).
 """
 function register_meta_model(name::AbstractString; run::Function)
     _CURRENT_META_REGISTRATION[] = MetaRegistration(String(name), run)
