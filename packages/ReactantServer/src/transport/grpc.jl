@@ -55,7 +55,14 @@ const _GRPC_STATUS_NAME = Dict{Int,String}(
     _G.GRPC_OUT_OF_RANGE => "OUT_OF_RANGE", _G.GRPC_UNIMPLEMENTED => "UNIMPLEMENTED",
     _G.GRPC_INTERNAL => "INTERNAL", _G.GRPC_UNAVAILABLE => "UNAVAILABLE", _G.GRPC_DATA_LOSS => "DATA_LOSS",
 )
-_status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") : "INTERNAL"
+_status_label(e) = e isa _G.gRPCServiceCallException ? get(_GRPC_STATUS_NAME, e.grpc_status, "UNKNOWN") :
+                   e isa DeadlineExceeded ? "DEADLINE_EXCEEDED" : "INTERNAL"
+
+# A request's effective absolute deadline (local time_ns()): the in-body KV timeout (carried through
+# the gateway's raw-byte forwarding, already converted to absolute at decode) takes precedence; a
+# direct client that set only grpc-timeout falls back to the gRPC context's parsed deadline.
+_effective_deadline(decoded_dl::Integer, grpc_dl::Integer) =
+    decoded_dl != 0 ? Int64(decoded_dl) : Int64(grpc_dl)
 
 _not_found(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_NOT_FOUND, msg))
 _invalid(msg) = throw(_G.gRPCServiceCallException(_G.GRPC_INVALID_ARGUMENT, msg))
@@ -154,6 +161,8 @@ function _infer_or_not_found(ctx::InferContext, request)
         return infer(ctx.sched, request)
     catch e
         e isa _G.gRPCServiceCallException && rethrow()
+        # A request the scheduler dropped at admission for an expired deadline -> DEADLINE_EXCEEDED.
+        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
         msg = sprint(showerror, e)
         (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
         rethrow()
@@ -162,12 +171,12 @@ end
 
 # Time and count every ModelInfer for the worker's Prometheus export (worker_requests_total by
 # model+status, worker_request_latency_seconds), then delegate to the handler body.
-function _handle_infer(ctx::InferContext, req)
-    ctx.metrics === nothing && return _handle_infer_impl(ctx, req)
+function _handle_infer(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
+    ctx.metrics === nothing && return _handle_infer_impl(ctx, req, grpc_deadline_ns)
     t0 = time()
     name = req.model_name
     try
-        resp = _handle_infer_impl(ctx, req)
+        resp = _handle_infer_impl(ctx, req, grpc_deadline_ns)
         observe_request!(ctx.metrics, name, time() - t0)
         inc_request!(ctx.metrics, name, "OK")
         return resp
@@ -178,15 +187,16 @@ function _handle_infer(ctx::InferContext, req)
     end
 end
 
-function _handle_infer_impl(ctx::InferContext, req)
+function _handle_infer_impl(ctx::InferContext, req, grpc_deadline_ns::Integer=0)
     name = req.model_name
     isempty(name) && _invalid("ModelInferRequest.model_name is empty")
     meta = get_meta(ctx.registry, name)
-    meta === nothing || return _handle_meta_infer(ctx, meta, req)
+    meta === nothing || return _handle_meta_infer(ctx, meta, req, grpc_deadline_ns)
     entry = get_model(ctx.registry, name)
     entry === nothing && _not_found("unknown model: $name")
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
-    request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs)
+    deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
+    request = InferRequest(name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(entry, request)
     outputs = _infer_or_not_found(ctx, request)   # availability rejections -> NOT_FOUND; else INTERNAL
     # Encoding rejects a requested output the model does not produce: a client mistake, so
@@ -198,11 +208,13 @@ end
 # mirroring `_infer_or_not_found`. This covers the LocalCaller path ("unknown model"/"was
 # unloaded" thrown by the scheduler); the GatewayCaller path surfaces a gRPCClient exception that
 # the worker's gRPC server already renders with its own status.
-function _meta_or_not_found(ctx::InferContext, meta, inputs::Vector{NamedTensor})
+function _meta_or_not_found(ctx::InferContext, meta, inputs::Vector{NamedTensor}, deadline_ns::Integer)
     try
-        return run_meta(meta, ctx.caller, inputs)
+        return run_meta(meta, ctx.caller, inputs; deadline_ns=deadline_ns)
     catch e
         e isa _G.gRPCServiceCallException && rethrow()
+        # The orchestration bailed (or a sub-call was dropped) because the deadline passed.
+        e isa DeadlineExceeded && throw(_G.gRPCServiceCallException(_G.GRPC_DEADLINE_EXCEEDED, sprint(showerror, e)))
         msg = sprint(showerror, e)
         (occursin("unknown model", msg) || occursin("was unloaded", msg)) && _not_found(msg)
         rethrow()
@@ -212,11 +224,12 @@ end
 # A meta model runs its Julia orchestration on this request task (off the GPU dispatch loop). Input
 # validation reuses the regular path (it reads only `manifest`, which MetaEntry also carries). The
 # orchestration's own sub-calls go through `ctx.caller`.
-function _handle_meta_infer(ctx::InferContext, meta, req)
+function _handle_meta_infer(ctx::InferContext, meta, req, grpc_deadline_ns::Integer=0)
     decoded = _as_invalid(() -> decode_infer_request(req, ctx.shm))
-    request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs)
+    deadline_ns = _effective_deadline(decoded.request.deadline_ns, grpc_deadline_ns)
+    request = InferRequest(meta.name, decoded.request.requested_outputs, decoded.request.inputs, deadline_ns)
     _validate_inputs(meta, request)
-    outputs = _meta_or_not_found(ctx, meta, request.inputs)
+    outputs = _meta_or_not_found(ctx, meta, request.inputs, deadline_ns)
     return _as_invalid(() -> encode_infer_response(meta.name, decoded, outputs, ctx.shm))
 end
 
@@ -261,7 +274,7 @@ function build_grpc_router(sched::Scheduler, registry::ModelRegistry, platform::
         ModelReady    = (req, ctx) -> _handle_model_ready(ctx.payload, req),
         ServerMetadata = (req, ctx) -> _handle_server_metadata(ctx.payload),
         ModelMetadata = (req, ctx) -> _handle_model_metadata(ctx.payload, req),
-        ModelInfer    = (req, ctx) -> _handle_infer(ctx.payload, req),
+        ModelInfer    = (req, ctx) -> _handle_infer(ctx.payload, req, ctx.deadline_ns),
         RepositoryIndex = (req, ctx) -> _handle_repository_index(ctx.payload, req),
         SystemSharedMemoryStatus     = (req, ctx) -> _handle_shm_status(ctx.payload.shm, req.name),
         SystemSharedMemoryRegister   = (req, ctx) -> _handle_shm_register(ctx.payload.shm, req),

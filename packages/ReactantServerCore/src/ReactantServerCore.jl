@@ -82,7 +82,7 @@ export WeightStore, PrivateWeightStore, SharedWeightStore
 export materialize_host_weights!, release_host_weights!, weights_digest
 
 # ---- boundary ----
-export NamedTensor, InferRequest, QueuedRequest
+export NamedTensor, InferRequest, QueuedRequest, DeadlineExceeded
 
 # ---- manifest ----
 export ManifestError, DimKind, FIXED, BATCH, VARIABLE, Dim, TensorSpec, BatchingSpec, Provenance, Manifest
@@ -114,5 +114,6 @@ export shm_regions, shm_teardown!
 export OutputTarget, DecodedRequest, decode_infer_request, encode_infer_response, encode_model_metadata
 export encode_repository_index, encode_shm_status, encode_shm_register_response, encode_shm_unregister_response, id_of
 export encode_infer_request, encode_infer_request_shm, decode_infer_response
+export deadline_params, TIMEOUT_NS_PARAM
 
 end # module ReactantServerCore

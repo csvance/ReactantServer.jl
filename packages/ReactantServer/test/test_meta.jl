@@ -98,6 +98,39 @@ end
     _RS.shutdown!(sched)
 end
 
+@testset "scheduler drops a request whose deadline has already passed" begin
+    sched, _ = _meta_local_caller()
+    x = [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
+    # An absolute deadline in the past is dropped at admission (before any GPU work) and surfaces as
+    # DeadlineExceeded; the dispatch loop never runs the executable for it.
+    expired = _RS.InferRequest("scale", String[], x, Int64(time_ns()) - Int64(1_000_000))
+    @test_throws _RS.DeadlineExceeded _RS.infer(sched, expired)
+    # A generous future deadline runs normally (x .* 2).
+    live = _RS.InferRequest("scale", String[], x, Int64(time_ns()) + Int64(60_000_000_000))
+    @test _RS.infer(sched, live)[1].data == Float32[2, 4, 6, 8]
+    # No deadline (0) is unaffected.
+    @test _RS.infer(sched, _RS.InferRequest("scale", String[], x))[1].data == Float32[2, 4, 6, 8]
+    _RS.shutdown!(sched)
+end
+
+@testset "meta bails before a sub-call once its deadline has passed" begin
+    sched, caller = _meta_local_caller()
+    started = Ref(false)
+    run = function (inputs, call)
+        started[] = true
+        return call("scale", inputs)        # the bail happens here, at the call boundary
+    end
+    meta = _RS.MetaEntry("detector", _meta_manifest("detector", ["scale"]), ["scale"], run)
+    x = [_RS.NamedTensor("x", Float32[1, 2, 3, 4])]
+    past = Int64(time_ns()) - Int64(1_000_000)
+    @test_throws _RS.DeadlineExceeded _RS.run_meta(meta, caller, x; deadline_ns = past)
+    @test started[]                          # the orchestration ran; only the sub-call was refused
+    # A generous deadline completes normally.
+    fut = Int64(time_ns()) + Int64(60_000_000_000)
+    @test _RS.run_meta(meta, caller, x; deadline_ns = fut)[1].data == Float32[2, 4, 6, 8]
+    _RS.shutdown!(sched)
+end
+
 # Write a minimal meta bundle (manifest.yaml + model.jl) under `root/name`.
 function _write_meta_bundle(root, name, calls; with_model_jl=true, run_body=nothing)
     dir = joinpath(root, name)

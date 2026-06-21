@@ -18,9 +18,12 @@ struct LocalCaller <: ModelCaller
     sched::Scheduler
 end
 
+# `deadline_ns` is an absolute local `time_ns()` deadline (0 = none). In-process, the sub-call shares
+# this worker's clock, so the meta's absolute deadline is passed straight through to the sub-request;
+# the scheduler then drops it at admission if it has already expired.
 call_model(c::LocalCaller, name::AbstractString, inputs::Vector{NamedTensor};
-           requested_outputs::Vector{String}=String[]) =
-    infer(c.sched, InferRequest(String(name), requested_outputs, inputs))
+           requested_outputs::Vector{String}=String[], deadline_ns::Integer=0) =
+    infer(c.sched, InferRequest(String(name), requested_outputs, inputs, Int64(deadline_ns)))
 
 # Loopback caller: routes a sub-call to the gateway over gRPC. The gateway's existing routing places
 # the backbone on whichever worker hosts it, so device placement stays abstracted from the meta
@@ -75,8 +78,11 @@ end
 
 # Build a sub-call request. All-or-nothing per call (the decode path treats raw_input_contents as
 # parallel-to-inputs): if every input's bytes live in `pool`, send by SHM reference; otherwise inline.
+# `parameters` carries the request-level KV map (the remaining-budget timeout), which rides through
+# the gateway's raw-byte forwarding unchanged to the destination worker.
 function _build_subcall_request(pool::Union{BufferPool,Nothing}, name::AbstractString,
-                                inputs::Vector{NamedTensor}, requested_outputs::Vector{String})
+                                inputs::Vector{NamedTensor}, requested_outputs::Vector{String},
+                                parameters::Dict{String,inference.InferParameter})
     if pool !== nothing && !isempty(inputs)
         base = pool_base_pointer(pool); nbytes = sizeof(pool)
         offs = Int[]
@@ -86,7 +92,7 @@ function _build_subcall_request(pool::Union{BufferPool,Nothing}, name::AbstractS
             o === nothing ? (ok = false; break) : push!(offs, o)
         end
         ok && return encode_infer_request_shm(name, inputs, pool_region_name(pool), offs;
-                                              requested_outputs=requested_outputs)
+                                              requested_outputs=requested_outputs, parameters=parameters)
         # A pool exists but some input is not a contiguous pool buffer -> inline. Diagnostic only (at
         # @debug): a meta legitimately passes large NON-scratch inputs through (e.g. the stage1 image),
         # so this is normal, not a warning; it's useful only when chasing why a buffer that WAS meant
@@ -96,12 +102,20 @@ function _build_subcall_request(pool::Union{BufferPool,Nothing}, name::AbstractS
                 @debug "meta sub-call input inlined (not a contiguous pool buffer)" model = name input = t.name bytes = sizeof(t.data)
         end
     end
-    return encode_infer_request(name, inputs; requested_outputs=requested_outputs)
+    return encode_infer_request(name, inputs; requested_outputs=requested_outputs, parameters=parameters)
 end
 
+# `deadline_ns` is an absolute local `time_ns()` deadline (0 = none). The sub-call crosses a process
+# boundary (loopback gRPC, possibly via the gateway to another worker), so the absolute deadline is
+# converted to a RELATIVE remaining budget and sent as the request-level timeout KV param; the
+# destination worker converts it back to its own local absolute deadline. A non-positive remaining
+# budget is unreachable here (the MetaCall bails before calling), but is encoded as "no deadline"
+# (empty params) defensively rather than as an already-expired one.
 function call_model(c::GatewayCaller, name::AbstractString, inputs::Vector{NamedTensor};
-                    requested_outputs::Vector{String}=String[])
-    req = _build_subcall_request(c.pool, name, inputs, requested_outputs)
+                    requested_outputs::Vector{String}=String[], deadline_ns::Integer=0)
+    budget = deadline_ns == 0 ? 0 : Int64(deadline_ns) - Int64(time_ns())
+    params = deadline_params(budget)
+    req = _build_subcall_request(c.pool, name, inputs, requested_outputs, params)
     resp = gRPCClient.grpc_sync_request(c.client, req)
     return decode_infer_response(resp)
 end
@@ -193,16 +207,24 @@ mutable struct MetaCall{C<:ModelCaller}
     declared::Set{String}
     slots::Vector{PoolSlot}
     scratched::Bool          # call.scratch may be used at most once per request (see _scratch)
+    deadline_ns::Int64       # absolute local time_ns() deadline for the whole orchestration (0 = none)
 end
-MetaCall(caller::ModelCaller, name::AbstractString, declared) =
-    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[], false)
+MetaCall(caller::ModelCaller, name::AbstractString, declared; deadline_ns::Integer=0) =
+    MetaCall(caller, String(name), Set{String}(declared), PoolSlot[], false, Int64(deadline_ns))
 
-# `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees.
+# `call(name, inputs)` — dispatch a sub-call, rejecting undeclared callees. Before issuing the
+# sub-call, bail if the orchestration's deadline has already passed: there is no point starting more
+# GPU work the caller has abandoned (the sub-call's own admission would drop it anyway, but bailing
+# here also stops the meta from issuing the remaining stages). The deadline is propagated to the
+# sub-call so its worker drops it at admission if it expires in flight.
 function (mc::MetaCall)(name::AbstractString, inputs::Vector{NamedTensor};
                         requested_outputs::Vector{String}=String[])
     String(name) in getfield(mc, :declared) ||
         error("meta model '$(getfield(mc, :name))' called undeclared model '$name'; add it to meta.calls")
-    return call_model(getfield(mc, :caller), name, inputs; requested_outputs=requested_outputs)
+    dl = getfield(mc, :deadline_ns)
+    dl != 0 && Int64(time_ns()) >= dl && throw(DeadlineExceeded(getfield(mc, :name)))
+    return call_model(getfield(mc, :caller), name, inputs;
+                      requested_outputs=requested_outputs, deadline_ns=dl)
 end
 
 # `call.scratch(...)` resolves to a closure over this MetaCall; every other field reads normally.
@@ -252,15 +274,19 @@ function _scratch(mc::MetaCall, reqs::AbstractVector)
 end
 
 """
-    run_meta(entry, caller, inputs) -> Vector{NamedTensor}
+    run_meta(entry, caller, inputs; deadline_ns=0) -> Vector{NamedTensor}
 
 Run a meta model's orchestration. The injected `call` (a [`MetaCall`](@ref)) dispatches sub-calls
 through `caller`, rejecting any callee not declared in `meta.calls`, and offers `call.scratch` for
-fan-out buffers. Any pool slots the orchestration acquired via `scratch` are released here when it
-returns (request-scoped), robust to the author reusing a buffer across sub-calls.
+fan-out buffers. `deadline_ns` is an absolute local `time_ns()` deadline for the whole orchestration
+(0 = none): once it passes, the next `call(...)` bails with [`DeadlineExceeded`](@ref) rather than
+issuing more GPU work, and every sub-call carries the remaining budget so its worker drops it at
+admission if it expires in flight. Any pool slots the orchestration acquired via `scratch` are
+released here when it returns (request-scoped), robust to the author reusing a buffer across sub-calls.
 """
-function run_meta(entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor})
-    mc = MetaCall(caller, entry.name, entry.calls)
+function run_meta(entry::MetaEntry, caller::ModelCaller, inputs::Vector{NamedTensor};
+                  deadline_ns::Integer=0)
+    mc = MetaCall(caller, entry.name, entry.calls; deadline_ns=deadline_ns)
     try
         # The orchestration is defined in a sandboxed model.jl (a newer world age), so cross it with
         # invokelatest, exactly as infer() does for pre/post hooks.

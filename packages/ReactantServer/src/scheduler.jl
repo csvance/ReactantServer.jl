@@ -336,6 +336,24 @@ end
 function execute_and_record!(s::Scheduler, d::Dispatch)
     entry, B, taken = d.entry, d.size, d.taken
     st = entry.sched
+    # Deadline admission: drop any request whose deadline has already passed before we begin GPU
+    # work. This is the only place a request is cancelled, and it never interrupts a running PJRT/GPU
+    # call — it only refuses to START work that is already expired. Expired requests get a
+    # DeadlineExceeded reply (mapped to gRPC DEADLINE_EXCEEDED upstream); only the live ones execute.
+    # When nothing is live we skip run_model entirely, so no GPU time is spent on abandoned work.
+    now_ns = Int64(time_ns())
+    live = QueuedRequest[]
+    for qr in taken
+        if qr.req.deadline_ns != 0 && now_ns >= qr.req.deadline_ns
+            put!(qr.reply, DeadlineExceeded(qr.req.model_name))
+        else
+            push!(live, qr)
+        end
+    end
+    if length(live) != length(taken)
+        taken = live          # the catch below and the slicing loop operate only on live requests
+        isempty(taken) && return nothing
+    end
     try
         # Inputs were already run through the model's preprocess hook on each caller's task before
         # the request was queued (see `infer`); the loop runs no model.jl code, only coalesce +

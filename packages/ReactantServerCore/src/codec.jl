@@ -13,6 +13,35 @@ const _SHM_REGION = "shared_memory_region"
 const _SHM_OFFSET = "shared_memory_offset"
 const _SHM_BYTE_SIZE = "shared_memory_byte_size"
 
+# Request-level KV parameter carrying the caller's REMAINING budget in nanoseconds (relative, not
+# an absolute timestamp). Like the SHM region params, this is an extension to KServe V2 passed
+# through `ModelInferRequest.parameters`. It is relative so each hop converts it to its own local
+# absolute deadline (`time_ns() + budget`), which makes it robust to cross-process monotonic-clock
+# differences and lets it ride unchanged through the gateway's raw-byte request forwarding.
+const TIMEOUT_NS_PARAM = "reactant_timeout_ns"
+
+"""
+    deadline_params(budget_ns) -> Dict{String,InferParameter}
+
+Build the request-level parameters map carrying a remaining-budget timeout of `budget_ns`
+nanoseconds (see [`TIMEOUT_NS_PARAM`](@ref)). A non-positive `budget_ns` yields an empty map (no
+deadline). Merge the result into a `ModelInferRequest`'s `parameters`.
+"""
+function deadline_params(budget_ns::Integer)
+    budget_ns > 0 || return Dict{String,_PB_INF.InferParameter}()
+    return Dict{String,_PB_INF.InferParameter}(TIMEOUT_NS_PARAM => _int_param(Int64(budget_ns)))
+end
+
+# Read the relative timeout budget (ns) from a request's parameters and convert it to an absolute
+# local deadline (`time_ns() + budget`), or 0 when absent/non-positive. Saturates instead of
+# overflowing on an absurd budget so a hostile value yields a far-future deadline, never a wrapped one.
+function _decode_deadline_ns(params)
+    budget = _param_int(params, TIMEOUT_NS_PARAM)
+    (budget === nothing || budget <= 0) && return Int64(0)
+    now = Int64(time_ns())
+    return budget > typemax(Int64) - now ? typemax(Int64) : now + Int64(budget)
+end
+
 # Element count and byte size of an untrusted wire shape, validated BEFORE any allocation:
 # every dim must be non-negative and the products must fit in Int. A hostile shape must be
 # rejected here, not by attempting the allocation it describes.
@@ -156,7 +185,8 @@ function decode_infer_request(msg::_PB_INF.ModelInferRequest,
         targets[o.name] = OutputTarget(region, offset, bsize)
     end
 
-    return DecodedRequest(InferRequest(msg.model_name, requested, tensors), msg.id, targets)
+    deadline_ns = _decode_deadline_ns(msg.parameters)
+    return DecodedRequest(InferRequest(msg.model_name, requested, tensors, deadline_ns), msg.id, targets)
 end
 
 # Copy a Julia col-major array's bytes into a fresh Vector{UInt8}. The bytes are already
@@ -265,13 +295,14 @@ Build a ModelInferRequest from boundary [`NamedTensor`](@ref) inputs, with tenso
 raw_input_contents. `requested_outputs`, when non-empty, names the outputs to return.
 """
 function encode_infer_request(model_name::AbstractString, inputs::Vector{NamedTensor};
-                              requested_outputs::Vector{String}=String[], id::AbstractString="")
+                              requested_outputs::Vector{String}=String[], id::AbstractString="",
+                              parameters::Dict{String,_PB_INF.InferParameter}=Dict{String,_PB_INF.InferParameter}())
     in_tensors = [_input_tensor(t) for t in inputs]
     raw = Vector{UInt8}[_raw_from_array(t.data) for t in inputs]
     outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
         _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
     return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
-        inputs=in_tensors, outputs=outs, raw_input_contents=raw)
+        inputs=in_tensors, outputs=outs, raw_input_contents=raw, parameters=parameters)
 end
 
 # Build an InferInputTensor that references bytes already staged in a shared-memory region rather
@@ -296,7 +327,8 @@ receiver must have `region` registered. This is all-or-nothing per request: the 
 """
 function encode_infer_request_shm(model_name::AbstractString, inputs::Vector{NamedTensor},
                                   region::AbstractString, offsets::Vector{<:Integer};
-                                  requested_outputs::Vector{String}=String[], id::AbstractString="")
+                                  requested_outputs::Vector{String}=String[], id::AbstractString="",
+                                  parameters::Dict{String,_PB_INF.InferParameter}=Dict{String,_PB_INF.InferParameter}())
     length(offsets) == length(inputs) ||
         throw(ArgumentError("encode_infer_request_shm: offsets ($(length(offsets))) != inputs ($(length(inputs)))"))
     in_tensors = [_shm_input_tensor(inputs[i], region, offsets[i], sizeof(inputs[i].data))
@@ -304,7 +336,7 @@ function encode_infer_request_shm(model_name::AbstractString, inputs::Vector{Nam
     outs = _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"[
         _PB_INF.var"ModelInferRequest.InferRequestedOutputTensor"(; name=String(n)) for n in requested_outputs]
     return _PB_INF.ModelInferRequest(; model_name=String(model_name), id=String(id),
-        inputs=in_tensors, outputs=outs)
+        inputs=in_tensors, outputs=outs, parameters=parameters)
 end
 
 """
