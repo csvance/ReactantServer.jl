@@ -10,12 +10,15 @@ SafeTensors = "eeda0dda-7046-4914-a807-2495fc7abb89"
 YAML = "ddb6d928-2868-570f-bddf-ab3f9cf99eb6"
 
 [weakdeps]
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
 PythonCall = "6099a3de-0909-46bc-b1f4-468b9a2dfc0d"
 
 [extensions]
+FluxExportExt = "Flux"
 PyTorchExportExt = "PythonCall"
 
 [compat]
+Flux = "0.14"
 JSON3 = "1.14.3"
 PythonCall = "0.9"
 Reactant = "0.2.262"

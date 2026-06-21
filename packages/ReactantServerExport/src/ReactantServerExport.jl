@@ -211,10 +211,12 @@ Export a model to a bundle, naming the frontend explicitly so the call site is u
 """
 export_bundle(frontend::Symbol, args...; kwargs...) = export_bundle(Val(frontend), args...; kwargs...)
 
-# Clear error when the PyTorch extension has not been loaded (less specific than the method the
-# extension adds, so the real implementation wins once PythonCall is present).
+# Clear error when the PyTorch or Flux extension has not been loaded
 export_bundle(::Val{:pytorch}, args...; kwargs...) =
     error("ReactantServerExport: `export_bundle(:pytorch, ...)` requires `using PythonCall` to load the extension")
+
+export_bundle(::Val{:flux}, args...; kwargs...) =
+    error("ReactantServerExport: `export_bundle(:flux, ...)` requires `using Flux` to load the extension")
 
 """
     export_bundle(:lux, model, ps, st, example_input; dir, name, input_name="input",
