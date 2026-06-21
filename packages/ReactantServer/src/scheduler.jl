@@ -137,12 +137,21 @@ end
 
 # A model can coalesce multiple requests only when its inputs carry a batch axis and every
 # output does too (so outputs can be split per request). Otherwise it serves one request per
-# dispatch. Single unbatched modules (exec key 0) are never coalesced.
+# dispatch. Single unbatched modules (batch key 0) are never coalesced.
 function _coalescable(entry::ModelEntry)
     m = entry.manifest
     m.input_batch_dim === nothing && return false
-    haskey(entry.executable.execs, 0) && return false
+    _has_unbatched(entry.executable) && return false
     return all(o -> o.batch_axis !== nothing, m.executable_outputs)
+end
+
+# The input-shape variant a queued request resolves to, read from its preprocessed (executable)
+# inputs. Empty for single-shape models, so they all share the one default variant `Int[]`.
+function _request_variant(entry::ModelEntry, prepared::Vector{NamedTensor})
+    spec = entry.executable.sig.variant_spec
+    isempty(spec) && return VariantKey()
+    byname = Dict(t.name => t for t in prepared)
+    return Int[size(byname[nm].data, ax) for (nm, ax) in spec]
 end
 
 _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === nothing ? nothing : sizes[i])
@@ -156,19 +165,36 @@ _smallest_ge(sizes::Vector{Int}, n::Int) = (i = findfirst(>=(n), sizes); i === n
 # dispatches alone. For non-coalescable models exactly one request is taken at its own size.
 function plan_batch(entry::ModelEntry, st::ModelSchedState)
     isempty(st.queue) && return nothing
-    sizes = sort!(collect(keys(entry.executable.execs)))
+    front = st.queue[1]
+    execs = entry.executable.execs
 
-    if !_coalescable(entry)
-        front = st.queue[1]
-        key = haskey(entry.executable.execs, 0) ? 0 :
+    # Pick the variant from the front request and only ever coalesce requests sharing it: different
+    # input shapes cannot be concatenated along the batch axis. An uncompiled shape dispatches alone
+    # so run_model raises the precise "no compiled program for input shape" error for that caller.
+    variant = _request_variant(entry, front.prepared)
+    haskey(execs, variant) || return (_request_rows(entry, front.req), QueuedRequest[front])
+    inner = execs[variant]
+    sizes = sort!(collect(keys(inner)))
+
+    if !_coalescable(entry) || haskey(inner, 0)
+        key = haskey(inner, 0) ? 0 :
               (_smallest_ge(sizes, _request_rows(entry, front.req)) === nothing ? maximum(sizes) :
                _smallest_ge(sizes, _request_rows(entry, front.req)))
         return (key, QueuedRequest[front])
     end
 
+    # The leading run of same-variant requests is the only window we may coalesce within (keeps
+    # `taken` a contiguous front prefix so _finalize can deleteat! it, and preserves FIFO order).
+    nprefix = 0
+    for qr in st.queue
+        _request_variant(entry, qr.prepared) == variant || break
+        nprefix += 1
+    end
+    prefix = view(st.queue, 1:nprefix)
+
     cap = st.max_batch_size === nothing ? typemax(Int) : st.max_batch_size
     minB, maxB = minimum(sizes), maximum(sizes)
-    R = min(sum(_request_rows(entry, qr.req) for qr in st.queue), cap)
+    R = min(sum(_request_rows(entry, qr.req) for qr in prefix), cap)
     # Largest compiled size that can be filled, else the smallest size for a partial fill.
     B = if R >= minB
         candidates = filter(<=(min(R, maxB)), sizes)
@@ -177,7 +203,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState)
         minB
     end
     # A single request may itself exceed B; grow B to the smallest size that fits it.
-    front_rows = _request_rows(entry, st.queue[1].req)
+    front_rows = _request_rows(entry, front.req)
     if B < front_rows
         grown = _smallest_ge(sizes, front_rows)
         B = grown === nothing ? maxB : grown
@@ -185,7 +211,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState)
 
     taken = QueuedRequest[]
     acc = 0
-    for qr in st.queue
+    for qr in prefix
         r = _request_rows(entry, qr.req)
         # B may exceed the cap on the partial-fill and front-oversize paths; bound by both.
         acc + r > min(B, cap) && break
@@ -193,7 +219,7 @@ function plan_batch(entry::ModelEntry, st::ModelSchedState)
         acc += r
     end
     # Forward progress: an indivisible front request larger than B or the cap dispatches alone.
-    isempty(taken) && push!(taken, st.queue[1])
+    isempty(taken) && push!(taken, front)
     return (B, taken)
 end
 
@@ -521,10 +547,12 @@ function _reject_pending_locked!(s::Scheduler)
     return nothing
 end
 
-# Build zero-filled executable inputs at batch size `sz` (0 = unbatched) for warmup. Returns
-# nothing if any input carries a variable axis we cannot size.
-function _zero_inputs(entry::ModelEntry, sz::Int)
+# Build zero-filled executable inputs at batch size `sz` (0 = unbatched) and input-shape `variant`
+# for warmup. The variant supplies the variable-axis sizes in the same (input, axis) order they were
+# collected in (see ModelSignature.variant_spec); returns nothing if it runs short.
+function _zero_inputs(entry::ModelEntry, variant::VariantKey, sz::Int)
     inputs = NamedTensor[]
+    vi = 0
     for sp in entry.manifest.executable_inputs
         dims = Int[]
         for d in sp.shape
@@ -532,8 +560,10 @@ function _zero_inputs(entry::ModelEntry, sz::Int)
                 push!(dims, sz == 0 ? 1 : sz)
             elseif d.kind == FIXED
                 push!(dims, d.size)
-            else
-                return nothing            # variable axis: cannot synthesize
+            else                          # variable axis: take the next size from the variant
+                vi += 1
+                vi <= length(variant) || return nothing
+                push!(dims, variant[vi])
             end
         end
         push!(inputs, NamedTensor(sp.name, zeros(julia_type(sp.dtype), dims...)))
@@ -546,16 +576,18 @@ end
 function _warmup_entry!(s::Scheduler, entry::ModelEntry)
     (entry.executable === nothing || entry.sched === nothing) && return nothing
     isempty(entry.manifest.executable_inputs) && return nothing   # cannot synthesize inputs
-    for sz in keys(entry.executable.execs)
-        inputs = _zero_inputs(entry, sz)
-        inputs === nothing && continue
-        try
-            s.weight_cache === nothing || acquire!(s.weight_cache, entry)
-            t0 = time()
-            run_model(s.backend, s.pool, entry.executable, inputs)
-            entry.sched.cost_estimate[sz] = max(time() - t0, eps())
-        catch err
-            @warn "scheduler cost warmup failed; using default cost" model = entry.name size = sz exception = err
+    for (variant, inner) in entry.executable.execs
+        for sz in keys(inner)
+            inputs = _zero_inputs(entry, variant, sz)
+            inputs === nothing && continue
+            try
+                s.weight_cache === nothing || acquire!(s.weight_cache, entry)
+                t0 = time()
+                run_model(s.backend, s.pool, entry.executable, inputs)
+                entry.sched.cost_estimate[sz] = max(time() - t0, eps())
+            catch err
+                @warn "scheduler cost warmup failed; using default cost" model = entry.name variant = variant size = sz exception = err
+            end
         end
     end
     return nothing
@@ -874,7 +906,7 @@ end
 # 0 when no batched shape is compiled. Reported over the control plane as routing metadata.
 function _effective_max_batch(entry::ModelEntry)
     largest = 0
-    for k in keys(entry.executable.execs)
+    for inner in values(entry.executable.execs), k in keys(inner)
         k > largest && (largest = k)
     end
     cap = entry.sched.max_batch_size

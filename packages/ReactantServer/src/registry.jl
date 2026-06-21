@@ -52,7 +52,7 @@ end
 mutable struct ModelEntry
     name::String
     manifest::Manifest
-    mlir_bytes::Dict{Int,Vector{UInt8}}  # batch size -> StableHLO portable artifact; key 0 = single unbatched module
+    mlir_bytes::Dict{VariantKey,Dict{Int,Vector{UInt8}}}  # variant -> (batch size -> StableHLO artifact); batch key 0 = single unbatched module
     weights_path::String
     weights::Any                          # SafeTensors handle (mmap), kept lazy; backend-opaque
     executable::Union{LoadedModel,Nothing}   # compiled runtime + residency; `nothing` until compiled
@@ -60,6 +60,14 @@ mutable struct ModelEntry
     preprocess::Function
     postprocess::Function
 end
+
+# Convenience constructor accepting a flat batch-size -> bytes map, wrapped as the single default
+# input-shape variant `Int[]`. Keeps hand-built entries (tests, fixtures) working while the field
+# is variant-nested; the loader passes the nested map directly.
+ModelEntry(name, manifest, mlir_bytes::Dict{Int,Vector{UInt8}}, weights_path, weights,
+           executable, sched, preprocess, postprocess) =
+    ModelEntry(name, manifest, Dict{VariantKey,Dict{Int,Vector{UInt8}}}(VariantKey() => mlir_bytes),
+               weights_path, weights, executable, sched, preprocess, postprocess)
 
 # A meta model: a Julia orchestration over other models. It has no executable, weights, or
 # scheduling state; the gRPC layer runs `run` directly on the request task (see meta.jl).
