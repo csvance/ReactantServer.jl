@@ -50,17 +50,28 @@ control plane pins them.
     SchedulingDiscipline
 
 The inter-model dispatch ordering. `FAIR` is the deficit-weighted, cost-aware policy with
-per-model weights and the coalescing discount; `FIFO` serves in global arrival order. Coalescing
-runs underneath both.
+per-model weights and the coalescing discount; `FIFO` serves in global arrival order; `EDF`
+(earliest-deadline-first) serves the model whose most-urgent queued request has the soonest
+deadline. Coalescing runs underneath all three.
 
 Guidance: `FAIR` is for deployments where models share this worker with no upstream placement
 authority, a single-GPU worker or a multi-GPU fleet behind the round-robin gateway, where the
 worker itself must stop one model from crowding out the rest. Under the gateway's `lpt_packing`
 scheduling the gateway is the fairness authority (placement concentration plus the per-worker
-share cap), and workers must run `FIFO` so the two do not fight; `lpt_packing` supersedes the
-role `FAIR` played on manually-assigned multi-GPU fleets.
+share cap), and workers must run `FIFO` or `EDF` so the two do not fight; `lpt_packing` supersedes
+the role `FAIR` played on manually-assigned multi-GPU fleets.
+
+`EDF` is for deadline-sensitive deployments where requests carry a remaining-budget timeout (see
+the request-level timeout parameter). It degrades to `FIFO` whenever queued requests share the
+same deadline, so its only divergence from `FIFO` is to promote requests with less budget left,
+in practice the in-flight meta-model sub-calls that have already spent part of their budget on an
+earlier stage. It also sheds work that cannot finish within its learned compute cost (laxity), so
+it trades some throughput (batch fragmentation, and no per-model fairness) for hitting more
+deadlines under load. NOTE: `EDF` derives urgency purely from the deadline, so issuing different
+per-client deadlines for the same model reorders that model's service and therefore affects
+fairness across clients; uniform deadlines keep it behaving like `FIFO`.
 """
-@enum SchedulingDiscipline FAIR FIFO
+@enum SchedulingDiscipline FAIR FIFO EDF
 
 """
     RuntimeConfig
@@ -377,7 +388,8 @@ function _parse_discipline(s)
     ls = lowercase(strip(s))
     ls == "fair" && return FAIR
     ls == "fifo" && return FIFO
-    throw(ConfigError("scheduler.discipline must be 'fair' or 'fifo', got '$s'"))
+    ls == "edf" && return EDF
+    throw(ConfigError("scheduler.discipline must be 'fair', 'fifo', or 'edf', got '$s'"))
 end
 
 function _parse_residency(s)

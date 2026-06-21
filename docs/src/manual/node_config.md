@@ -52,7 +52,7 @@ global:
     allow_cpu_fallback: false
     weight_cache_bytes: 0  # GPU byte budget for on-demand weights; 0 keeps all resident
   scheduler:               # -> SchedulerConfig
-    discipline: fair       # fair | fifo (use fifo behind a gateway running lpt_packing)
+    discipline: fair       # fair | fifo | edf (use fifo or edf behind a gateway running lpt_packing)
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024  # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0
@@ -69,8 +69,21 @@ the repository and loads, unloads, and reloads bundles online as files change; `
 the startup set; `explicit` cedes the lifecycle to an external control plane via the worker
 control RPCs. `scheduler.discipline` selects the dispatch policy: `fair` shares GPU time
 across models by weighted deficit and learned cost, while `fifo` serves the oldest queued
-request first and is required on workers fronted by a gateway in `lpt_packing` mode (see
+request first. Workers fronted by a gateway in `lpt_packing` mode must run `fifo` or `edf` (not
+`fair`), so the gateway stays the placement and fairness authority (see
 [Multi-GPU Gateway](multi_gpu_gateway.md)).
+
+`edf` (earliest-deadline-first) serves the model whose most-urgent queued request has the
+soonest deadline, where the deadline comes from the request's remaining-budget timeout. It is
+designed for deadline-sensitive serving: while every client uses the same deadline it behaves
+exactly like `fifo`, and it diverges only to promote requests that have less budget left, in
+practice the in-flight meta-model sub-calls that already spent part of their budget on an earlier
+stage, so they finish instead of starving at the deadline line behind fresh full-budget requests.
+`edf` also sheds work it cannot finish within its learned compute cost (laxity), trading some
+throughput (batch fragmentation, and no per-model weighting) for meeting more deadlines under
+load. Note that because `edf` derives urgency solely from the deadline, issuing **different
+per-client deadlines for the same model reorders that model's service and therefore affects
+fairness across clients**; keep deadlines uniform to retain `fifo`-like fairness.
 
 Each sub-block corresponds to a typed config struct: [`RuntimeConfig`](@ref),
 [`SchedulerConfig`](@ref), [`ModelSchedConfig`](@ref), and [`EndpointsConfig`](@ref). See the

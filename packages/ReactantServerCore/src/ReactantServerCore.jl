@@ -98,7 +98,7 @@ export ConfigError, BackendKind, CPU_BACKEND, CUDA_BACKEND
 export ResidencyState, UNPINNED, PINNED_SYSTEM, PINNED_DEVICE
 export ResidencyMode, SELF_MANAGED, EXTERNALLY_MANAGED
 export ModelControlMode, STATIC, DYNAMIC, EXPLICIT
-export SchedulingDiscipline, FAIR, FIFO
+export SchedulingDiscipline, FAIR, FIFO, EDF
 export RuntimeConfig, ModelSchedConfig, SchedulerConfig, EndpointsConfig, ServerConfig
 export build_config, validate_config, apply_env_overrides!, log_effective_config
 
