@@ -560,26 +560,29 @@ end
 # between stages the loop serves other models. A meta whose deadline passes before it can take a permit
 # is shed before any GPU work. A COMPUTE-ONLY meta (empty `calls`) issues no sub-calls and so contends
 # for nothing the gate protects; it bypasses the gate entirely, so a heavy pure-Julia meta never blocks
-# a GPU meta from a permit. The meta's wall time seeds its serving counters for the control plane.
+# a GPU meta from a permit. The meta's recorded compute is the time spent INSIDE its sub-calls (its
+# GPU/model-call cost), NOT its wall time: the data-dependent Julia glue between stages is excluded, so
+# the control plane (lpt_packing) balances on the meta's real device work rather than its CPU glue. A
+# compute-only meta therefore reports ~0 compute, which is correct — it consumes no GPU.
 function _run_meta_request(s::Scheduler, meta::MetaEntry, req::InferRequest)
     # Base deadline check first: no point starting already-expired work (no GPU spent yet).
     req.deadline_ns != 0 && Int64(time_ns()) >= req.deadline_ns && throw(DeadlineExceeded(meta.name))
     gated = !isempty(meta.calls)   # compute-only metas (no sub-calls) skip the gate
     gated && acquire_meta_gate!(s.meta_gate, meta.name; deadline_ns=req.deadline_ns)
     caller = QueueingCaller(s, s.scratch_pool)
-    t0 = time()
+    call_ns = Ref(Int64(0))
     try
-        out = run_meta(meta, caller, req.inputs; deadline_ns=req.deadline_ns)
-        wall = time() - t0
+        out = run_meta(meta, caller, req.inputs; deadline_ns=req.deadline_ns, call_ns_out=call_ns)
+        compute = call_ns[] / 1e9     # sub-call (model) time only; the Julia glue between stages is excluded
         st = meta.sched
         lock(s.cond) do
             now = time()
             _decay_ema!(st, s.cfg.ema_halflife_seconds, now)
-            st.recent_compute_ema += wall
-            _update_cost!(st, 0, wall, s.cfg.cost_ema_alpha)
+            st.recent_compute_ema += compute
+            _update_cost!(st, 0, compute, s.cfg.cost_ema_alpha)
             st.dispatch_count += 1
             st.requests_served += 1
-            st.total_compute += wall
+            st.total_compute += compute
         end
         return out
     finally
