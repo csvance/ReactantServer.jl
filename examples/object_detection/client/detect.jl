@@ -83,7 +83,7 @@ function draw(display_img, dets, outfile)
         d.score >= DISPLAY_THRESH || continue
         shown += 1
         lines!(ax, [d.x1, d.x2, d.x2, d.x1, d.x1], [d.y1, d.y1, d.y2, d.y2, d.y1];
-               color = :red, linewidth = 2)
+               color = RGBf(0, 1, 0), linewidth = 2)
         text!(ax, d.x1 + 2, d.y1 + 2; text = "$(label_for(d.class)) $(round(d.score; digits = 2))",
               color = :yellow, fontsize = 14, align = (:left, :top))
     end
