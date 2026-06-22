@@ -1,0 +1,20 @@
+# Handlers-only conversion config for the object detection demo: builds a single torchvision
+# Faster R-CNN (pretrained COCO) into three StableHLO bundles under ./bundles/ with no Triton
+# source repository. Run from this directory:
+#
+#   julia --project=. ../../tools/convert_to_stablehlo.jl detector.convert.yaml --only object_detector
+#
+# (demo.jl runs this for you on first launch). Paths are relative to this config file.
+
+output_root: bundles
+report_path: bundles/conversion_report.md
+
+handlers:
+  - file: ../../tools/handlers/torchvision_frcnn_detector.jl
+    models: [object_detector]
+    options:
+      weights: DEFAULT     # pretrained COCO weights (downloaded by torchvision on first export)
+      num_classes: 91      # COCO classes including background
+      image_size: 640      # canonical square input edge (divisible by 64)
+      input_dtype: u8      # client sends a uint8 image; stage1 bakes /255 + ImageNet normalize
+      output_cols: 6       # per detection: [x1, y1, x2, y2, score, class]
