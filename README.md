@@ -24,12 +24,6 @@ an example configuration for each.
   for dev/fallback); supporting more accelerators is a goal, not a redesign. → [Architecture](https://enzymead.github.io/ReactantServer.jl/dev/design/architecture/), [Philosophy](https://enzymead.github.io/ReactantServer.jl/dev/design/philosophy/)
 - **Julia-first pre/postprocessing.** A bundle's `model.jl` registers `preprocess`/`postprocess`
   hooks in plain Julia; they run per request, in parallel and overlapped with GPU execution. → [Bundles & model.jl](https://enzymead.github.io/ReactantServer.jl/dev/manual/bundles/)
-- **Meta models.** A `kind: meta` bundle chains several models with data-dependent Julia between
-  stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the GPU dispatch
-  loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/manual/meta_models/)
-- **Worked object detection example.** An end-to-end pipeline converts a torchvision Faster R-CNN
-  into two StableHLO stages chained by plain-Julia detection glue (anchors, box decode, NMS,
-  ROIAlign), built on the meta-model machinery. → [Object Detection](https://enzymead.github.io/ReactantServer.jl/dev/manual/object_detection/)
 - **Julia-aligned conventions.** Shapes are column-major with the batch axis last, the way Julia
   and Lux write them; the codec converts to KServe's row-major wire at the boundary, so Triton
   clients are unchanged and you never reason about row-major order. → [Getting Started](https://enzymead.github.io/ReactantServer.jl/dev/manual/getting_started/)
@@ -53,6 +47,9 @@ an example configuration for each.
 - **Fast iteration.** In `dynamic` mode the server watches the model repository and hot-loads,
   unloads, and reloads bundles online — weights, MLIR, manifest, and `model.jl` alike — with no
   restart (`static` and `explicit` control modes are also available). → [Node Configuration](https://enzymead.github.io/ReactantServer.jl/dev/manual/node_config/)
+- **Meta models.** A `kind: meta` bundle chains several models with data-dependent Julia between
+  stages: its `model.jl` registers a `run` hook that calls sub-models, runs off the GPU dispatch
+  loop, and re-enters the scheduler for each sub-call. → [Meta Models](https://enzymead.github.io/ReactantServer.jl/dev/manual/meta_models/)
 
 ## Quick start
 
