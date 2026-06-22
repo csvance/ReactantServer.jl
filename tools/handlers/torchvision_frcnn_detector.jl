@@ -202,8 +202,9 @@ function _run(inputs, call)
     s2=call("$s2_name",[ReactantServer.NamedTensor("ROI_FEATS",roi)])
     d2=Dict(t.name=>t.data for t in s2)
     cls=permutedims(d2["cls_logits"],(2,1))[1:Kp,:]; dl=permutedims(d2["bbox_deltas"],(2,1))[1:Kp,:]
-    # torchvision FastRCNNPredictor puts background at class 0 -> bg_first=true.
-    bx,sc,cl=_G.fast_rcnn_inference(cls,dl,pb,ih,iw;score_thresh=_SCORE,nms_thresh=_NMS,topk=_TOPK,weights=_ROIW,bg_first=true)
+    # torchvision FastRCNNPredictor puts background at class 0 -> bg_first=true; postprocess drops
+    # final boxes smaller than 1e-2 px (remove_small_boxes) -> min_size=1e-2.
+    bx,sc,cl=_G.fast_rcnn_inference(cls,dl,pb,ih,iw;score_thresh=_SCORE,nms_thresh=_NMS,topk=_TOPK,weights=_ROIW,bg_first=true,min_size=1e-2)
     D = $out_line
     return [ReactantServer.NamedTensor("OUTPUT__0", D)]
 end

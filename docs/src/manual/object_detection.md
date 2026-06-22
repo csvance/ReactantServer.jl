@@ -129,7 +129,7 @@ function _run(inputs, call)
     cls = permutedims(d2["cls_logits"], (2, 1))[1:Kp, :]
     dl  = permutedims(d2["bbox_deltas"], (2, 1))[1:Kp, :]
     bx, sc, cl = _G.fast_rcnn_inference(cls, dl, pb, ih, iw;
-        score_thresh=_SCORE, nms_thresh=_NMS, topk=_TOPK, weights=_ROIW, bg_first=true)
+        score_thresh=_SCORE, nms_thresh=_NMS, topk=_TOPK, weights=_ROIW, bg_first=true, min_size=1e-2)
 
     return [ReactantServer.NamedTensor("OUTPUT__0", assemble(bx, sc, cl))]
 end
@@ -139,9 +139,10 @@ register_meta_model("my_detector"; run = _run)
 
 Every data-dependent step is a plain function in `ReactantServer.DetectionGlue`:
 `generate_anchors`, `decode_boxes`, `select_rpn_proposals`, `roi_align_wire!`, `assign_level`, and
-`fast_rcnn_inference`. Two `DetectionGlue` knobs select the torchvision conventions:
+`fast_rcnn_inference`. A few `DetectionGlue` knobs select the torchvision conventions:
 `roi_align_wire!(...; aligned=false)` uses torchvision's ROIAlign offset and malformed-ROI clamp, and
-`fast_rcnn_inference(...; bg_first=true)` treats class 0 as background. The
+`fast_rcnn_inference(...; bg_first=true, min_size=1e-2)` treats class 0 as background and drops
+sub-pixel final boxes the way torchvision's `postprocess_detections` does. The
 ROI feature tensor is the large intermediate handed between stages, so it is allocated from the
 worker's reuse pool with `call.scratch`; in a fleet that buffer is backed by a shared-memory slot so
 the sub-call sends it by reference instead of serializing it (see the `call.scratch` section of

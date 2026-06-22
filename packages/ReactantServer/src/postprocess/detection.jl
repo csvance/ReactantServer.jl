@@ -245,11 +245,14 @@ class-agnostic), `proposals` [K,4]. Mirrors fast_rcnn_inference_single_image.
 and columns `1:end-1` as foreground; `true` (torchvision FastRCNNPredictor) treats column **1** as
 background and columns `2:end` as foreground. In both cases the per-class delta group for foreground
 column `c` is `c-1` (0-based), and the emitted class id is `c-1`.
+
+`min_size` drops decoded boxes whose width or height is below it before the final NMS (torchvision's
+`postprocess_detections` uses `1e-2`); the default `0.0` keeps every box.
 """
 function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, proposals::AbstractMatrix,
                              imgH::Real, imgW::Real; score_thresh::Real, nms_thresh::Real,
                              topk::Int, weights::NTuple{4,<:Real}=(10.0, 10.0, 5.0, 5.0),
-                             bg_first::Bool=false)
+                             bg_first::Bool=false, min_size::Real=0.0)
     K = size(cls, 1); nrc = size(deltas, 2) ÷ 4
     dec = decode_boxes(deltas, proposals, weights)            # [K, nrc*4]
     @inbounds for m in 1:K, c in 0:(nrc - 1)
@@ -269,6 +272,12 @@ function fast_rcnn_inference(cls::AbstractMatrix, deltas::AbstractMatrix, propos
     end
     isempty(cs) && return (Matrix{Float64}(undef, 0, 4), Float64[], Int[])
     boxes = reduce(vcat, (b' for b in cb))
+    if min_size > 0
+        ks = findall(i -> (boxes[i, 3] - boxes[i, 1]) >= min_size && (boxes[i, 4] - boxes[i, 2]) >= min_size,
+                     1:size(boxes, 1))
+        isempty(ks) && return (Matrix{Float64}(undef, 0, 4), Float64[], Int[])
+        boxes, cs, cc = boxes[ks, :], cs[ks], cc[ks]
+    end
     keep = batched_nms(boxes, cs, cc, nms_thresh)
     topk >= 0 && (keep = keep[1:min(topk, length(keep))])
     return (boxes[keep, :], cs[keep], cc[keep])

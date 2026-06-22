@@ -48,4 +48,17 @@ const _G = ReactantServer.DetectionGlue
             score_thresh=0.05, nms_thresh=0.5, topk=100, bg_first=false)
         @test sort(c0) == [0, 1]
     end
+
+    @testset "fast_rcnn_inference min_size drops sub-pixel boxes" begin
+        # proposal 1 is a sub-pixel box (0.005 px); zero deltas keep decoded == proposal.
+        proposals = Float64[10 10 10.005 10.005; 20 20 60 60]
+        deltas = zeros(Float64, 2, 3*4)
+        cls = Float64[0 5 0; 0 5 0]   # both rows -> foreground class 1 (bg_first)
+        _,_,c_keep = _G.fast_rcnn_inference(cls, deltas, proposals, 100, 100;
+            score_thresh=0.05, nms_thresh=0.5, topk=100, bg_first=true, min_size=0.0)
+        _,_,c_drop = _G.fast_rcnn_inference(cls, deltas, proposals, 100, 100;
+            score_thresh=0.05, nms_thresh=0.5, topk=100, bg_first=true, min_size=1e-2)
+        @test length(c_keep) == 2     # both kept without a size filter
+        @test length(c_drop) == 1     # the sub-pixel box is dropped (torchvision min_size=1e-2)
+    end
 end
