@@ -221,8 +221,9 @@ flowchart TD
 
 **The endpoint contract.** Each node exposes the same interface a control plane integrates
 against: the KServe V2 gRPC data plane (`ModelInfer`, `RepositoryIndex`, `ServerReady`) plus the
-worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy`) for residency and
-policy, and an admin HTTP port serving `/healthz`, `/readyz`, and Prometheus `/metrics`. Your
+worker control RPCs (`ModelControlStatus`, `SetModelResidency`, `SetModelPolicy` for residency and
+policy, `CompactMemory` to defragment device memory), and an admin HTTP port serving `/healthz`,
+`/readyz`, and Prometheus `/metrics`. Your
 control plane discovers which models each node serves via `RepositoryIndex` and routes `ModelInfer`
 to a node that reports the model ready.
 

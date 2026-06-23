@@ -56,6 +56,8 @@ global:
     ema_halflife_seconds: 30.0
     max_queue_depth: 1024  # per-model queue cap; a full model rejects new requests
     dispatch_timeout_seconds: 30.0
+    compaction_interval: 0 # worker-local: defragment device memory every N on-demand weight loads;
+                           # 0 disables (the default). Leave 0 behind a gateway (see On-demand Weights)
     models: {}             # per-model overrides -> ModelSchedConfig (see below)
   endpoints:               # -> EndpointsConfig
     host: 0.0.0.0          # bind all interfaces so the gateway/clients can reach the worker

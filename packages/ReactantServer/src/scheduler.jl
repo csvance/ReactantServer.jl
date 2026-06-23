@@ -105,12 +105,15 @@ mutable struct Scheduler
     committed::Vector{QueuedRequest}           # in-flight metas' continuation sub-calls awaiting the next GPU slot, each
                                                # dispatched ahead of the discipline scan. One entry per in-flight meta, so
                                                # it is bounded by the gate: committed count == REACTANT_META_CONCURRENCY.
+    compact_loads_mark::Int                    # weight-cache load count at the last automatic compaction; sole
+                                               # writer is the dispatch thread. Drives load-driven compaction:
+                                               # compact once `weight_cache.loads` advances by `cfg.compaction_interval`.
 end
 
 function Scheduler(registry::ModelRegistry, backend::AbstractBackend, pool::MemoryPool, cfg::SchedulerConfig)
     return Scheduler(registry, backend, pool, cfg,
                      Threads.Condition(), false, nothing, nothing, nothing, ControlCommand[],
-                     MetaGate(1), QueuedRequest[])
+                     MetaGate(1), QueuedRequest[], 0)
 end
 
 # A selected dispatch: the model entry, the chosen executable key (batch size; 0 = unbatched
@@ -785,7 +788,10 @@ function dispatch_loop(s::Scheduler)
             end
         end
         (isempty(cmds) && chosen === nothing) && break
-        chosen === nothing || execute_and_record!(s, chosen)
+        if chosen !== nothing
+            execute_and_record!(s, chosen)
+            _maybe_compact!(s)
+        end
     end
     return nothing
 end
@@ -858,6 +864,54 @@ function set_policy!(s::Scheduler, name::AbstractString; weight::Union{Real,Noth
         entry = get(s.registry.by_name, String(name), nothing)
         (entry === nothing || entry.sched === nothing) && throw(ErrorException("unknown model: $name"))
         weight === nothing || (entry.sched.weight = Float64(weight))
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------------------------
+# Memory compaction: free all resident device weights so the allocator coalesces its free list,
+# then reload the working set. Defragments the device arena (see `compact!` on the WeightCache).
+# ---------------------------------------------------------------------------------------------
+
+# Body assuming it already runs on the dispatch thread (mirrors `_admit_entry!`/`_evict_entry!`).
+# A no-op without the on-demand cache: there, every model is permanently device-resident from
+# startup (nothing churns), so there is no fragmenting working set to compact.
+function _compact_entry!(sch::Scheduler; reload_models::Vector{String}=String[])
+    sch.weight_cache === nothing && return 0
+    return compact!(sch.weight_cache, sch.registry; reload=reload_models)
+end
+
+"""
+    compact!(scheduler; reload_models=String[]) -> Int
+
+Free the resident non-pinned device weights so the allocator coalesces its free list, then reload
+each model named in `reload_models`. An empty list frees only; non-pinned models not listed reload
+lazily on their next dispatch (self-managed mode). Device-pinned models are left in place (loaded
+once at startup, never reloaded from disk). A no-op when the on-demand weight cache is disabled.
+Runs on the dispatch thread (the sole residency mutator) and blocks until applied. Returns the
+number of models reloaded.
+"""
+compact!(s::Scheduler; reload_models::Vector{String}=String[]) =
+    _run_control(s, sch -> _compact_entry!(sch; reload_models=reload_models))
+
+# Automatic, worker-local compaction driven by `cfg.compaction_interval` (0 disables), counting
+# on-demand weight-cache loads, not dispatches: a load is what places a variable-size weight block
+# and so drives fragmentation, while a dispatch to an already-resident model does not. This is the
+# standalone (no-gateway) trigger and is off by default, so a gateway-fronted worker never
+# self-compacts (the gateway owns compaction there, via the CompactMemory RPC). It is eager: the
+# on-demand region is freed and refills lazily as requests arrive.
+#
+# Called from the dispatch loop after a dispatch, so it is already on the dispatch thread and must
+# NOT go through `_run_control` (nesting it would deadlock). A failure must not kill the loop.
+function _maybe_compact!(s::Scheduler)
+    n = s.cfg.compaction_interval
+    (n > 0 && s.weight_cache !== nothing) || return nothing
+    s.weight_cache.loads - s.compact_loads_mark >= n || return nothing
+    s.compact_loads_mark = s.weight_cache.loads
+    try
+        _compact_entry!(s)
+    catch e
+        @warn "automatic compaction failed" exception = (e, catch_backtrace())
     end
     return nothing
 end

@@ -157,8 +157,10 @@ batches; `cost_ema_alpha` is the smoothing factor for the learned per-batch-size
 `max_queue_depth` caps each model's queue independently (a full model rejects new requests
 without affecting admission for the others); `dispatch_timeout_seconds` is the per-request
 execution timeout; `discipline` selects the inter-model ordering (see
-[`SchedulingDiscipline`](@ref)); and `models` holds the per-model [`ModelSchedConfig`](@ref)
-overrides.
+[`SchedulingDiscipline`](@ref)); `compaction_interval` runs worker-local memory compaction every N
+on-demand weight-cache loads (0 disables), the standalone (no-gateway) trigger, off by default so a
+gateway-fronted worker never self-compacts; and `models` holds the per-model
+[`ModelSchedConfig`](@ref) overrides.
 """
 struct SchedulerConfig
     ema_halflife_seconds::Float64
@@ -168,18 +170,19 @@ struct SchedulerConfig
     max_queue_depth::Int
     dispatch_timeout_seconds::Float64
     discipline::SchedulingDiscipline
+    compaction_interval::Int
     models::Dict{String,ModelSchedConfig}
 end
 
 # Convenience constructor preserving the original three-argument form. The cost-aware knobs,
-# discipline, and per-model overrides take their defaults unless passed as keywords.
+# discipline, compaction interval, and per-model overrides take their defaults unless passed as keywords.
 SchedulerConfig(ema_halflife_seconds::Real, max_queue_depth::Integer, dispatch_timeout_seconds::Real;
     recency_penalty_cap::Real=0.25, coalescing_discount::Real=0.10, cost_ema_alpha::Real=0.2,
-    discipline::SchedulingDiscipline=FAIR,
+    discipline::SchedulingDiscipline=FAIR, compaction_interval::Integer=0,
     models::Dict{String,ModelSchedConfig}=Dict{String,ModelSchedConfig}()) =
     SchedulerConfig(Float64(ema_halflife_seconds), Float64(recency_penalty_cap),
         Float64(coalescing_discount), Float64(cost_ema_alpha), Int(max_queue_depth),
-        Float64(dispatch_timeout_seconds), discipline, models)
+        Float64(dispatch_timeout_seconds), discipline, Int(compaction_interval), models)
 
 """
     EndpointsConfig
@@ -266,6 +269,7 @@ const ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULER_COST_EMA_ALPHA", ["scheduler", "cost_ema_alpha"], Float64),
     ("SCHEDULER_MAX_QUEUE_DEPTH", ["scheduler", "max_queue_depth"], Int),
     ("SCHEDULER_DISPATCH_TIMEOUT_SECONDS", ["scheduler", "dispatch_timeout_seconds"], Float64),
+    ("SCHEDULER_COMPACTION_INTERVAL", ["scheduler", "compaction_interval"], Int),
     ("ENDPOINTS_HOST", ["endpoints", "host"], String),
     ("ENDPOINTS_PORT", ["endpoints", "port"], Int),
     ("ENDPOINTS_METRICS_PORT", ["endpoints", "metrics_port"], Int),
@@ -463,6 +467,7 @@ function build_config(raw::AbstractDict)
         _opt(sc, "dispatch_timeout_seconds", Float64, 30.0),
         haskey(sc, "discipline") ?
             _parse_discipline(_coerce(String, sc["discipline"], "scheduler.discipline")) : FAIR,
+        _opt(sc, "compaction_interval", Int, 0),
         _parse_sched_models(sc),
     )
 
@@ -503,6 +508,8 @@ function validate_config(cfg::ServerConfig)
     0 <= cfg.scheduler.coalescing_discount < 1 || throw(ConfigError("scheduler.coalescing_discount must be in [0, 1)"))
     0 < cfg.scheduler.cost_ema_alpha <= 1 || throw(ConfigError("scheduler.cost_ema_alpha must be in (0, 1]"))
     cfg.scheduler.max_queue_depth > 0 || throw(ConfigError("scheduler.max_queue_depth must be positive"))
+    cfg.scheduler.compaction_interval >= 0 ||
+        throw(ConfigError("scheduler.compaction_interval must be non-negative (0 = disabled)"))
     for (name, mc) in cfg.scheduler.models
         mc.weight > 0 || throw(ConfigError("scheduler.models.$name.weight must be positive"))
         mc.max_batch_size === nothing || mc.max_batch_size >= 1 ||
@@ -521,7 +528,7 @@ end
 # `apply_env_overrides!` is applied on top by `node_server_config`.
 
 function log_effective_config(cfg::ServerConfig, applied)
-    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_bytes=cfg.runtime.weight_cache_bytes residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth scheduler_models=collect(keys(cfg.scheduler.models))
+    @info "Effective configuration" model_dirs=cfg.model_dirs models_include=cfg.models_include model_control_mode=cfg.model_control_mode model_poll_seconds=cfg.model_poll_seconds cache_dir=cfg.cache_dir backend=cfg.runtime.backend device_ordinal=cfg.runtime.device_ordinal mem_fraction=cfg.runtime.mem_fraction preallocate=cfg.runtime.preallocate allow_cpu_fallback=cfg.runtime.allow_cpu_fallback weight_cache_bytes=cfg.runtime.weight_cache_bytes residency_mode=cfg.runtime.residency_mode shared_host_weights=cfg.runtime.shared_host_weights shared_host_weights_mode=string(cfg.runtime.shared_host_weights_mode; base=8) host=cfg.endpoints.host port=cfg.endpoints.port metrics_port=cfg.endpoints.metrics_port max_concurrent_requests=cfg.endpoints.max_concurrent_requests discipline=cfg.scheduler.discipline ema_halflife_seconds=cfg.scheduler.ema_halflife_seconds recency_penalty_cap=cfg.scheduler.recency_penalty_cap coalescing_discount=cfg.scheduler.coalescing_discount cost_ema_alpha=cfg.scheduler.cost_ema_alpha max_queue_depth=cfg.scheduler.max_queue_depth compaction_interval=cfg.scheduler.compaction_interval scheduler_models=collect(keys(cfg.scheduler.models))
     isempty(applied) || @info "Configuration overridden by environment" overrides=first.(applied)
     return nothing
 end

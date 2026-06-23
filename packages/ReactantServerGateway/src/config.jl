@@ -69,6 +69,15 @@ struct GatewayConfig
     # than being rejected before the workers are even saturated.
     max_concurrent_streams_per_worker::Int
     max_concurrent_requests_per_worker::Int
+    # Memory compaction (lpt_packing only). After a placement-changing repack, the gateway can fan a
+    # `CompactMemory` RPC out to the workers whose assignment changed, defragmenting their on-demand
+    # weight region. `compaction_mode` selects what each worker reloads eagerly afterward: `:off`
+    # disables it, `:eager` reloads nothing (the region refills lazily as traffic arrives), and
+    # `:scheduled` reloads the set of models the repack just assigned to that worker (warming the new
+    # placement). `compaction_interval` is the cadence in repacks: the first placement-changing repack
+    # at or after this many repacks fires it (so it can land later than exactly N).
+    compaction_mode::Symbol
+    compaction_interval::Int
 end
 
 const GW_ENV_PREFIX = "REACTANT_GATEWAY_"
@@ -84,6 +93,8 @@ const GW_ENV_PATHS = Tuple{String,Vector{String},DataType}[
     ("SCHEDULING_DEFAULT_REPLICAS", ["scheduling", "default_replicas"], String),
     ("SCHEDULING_ROUTING_FILL_FACTOR", ["scheduling", "routing_fill_factor"], Float64),
     ("SCHEDULING_ROUTING_POLICY", ["scheduling", "routing_policy"], String),
+    ("SCHEDULING_COMPACTION_MODE", ["scheduling", "compaction_mode"], String),
+    ("SCHEDULING_COMPACTION_INTERVAL", ["scheduling", "compaction_interval"], Int),
     ("WORKER_CLIENT_REQUEST_TIMEOUT_SECONDS", ["worker_client", "request_timeout_seconds"], Int),
     ("WORKER_CLIENT_MAX_CONCURRENT_STREAMS", ["worker_client", "max_concurrent_streams"], Int),
     ("GRPC_MAX_RECV_MSG_BYTES", ["grpc", "max_recv_msg_bytes"], Int),
@@ -193,6 +204,7 @@ function _build_gateway_config(raw::Dict{String,Any})
         throw(ConfigError("scheduling.routing_policy no longer accepts 'least_outstanding'; it is now a top-level scheduling mode. Set scheduling.mode: least_outstanding instead."))
     routing_policy in ("fill_rr", "fill_least") ||
         throw(ConfigError("scheduling.routing_policy must be 'fill_rr' or 'fill_least', got '$routing_policy'"))
+    compaction_mode = _parse_gateway_compaction_mode(_opt(sched, "compaction_mode", String, "off"))
 
     cfg = GatewayConfig(
         _opt(listen, "grpc", String, "0.0.0.0:8001"),
@@ -216,6 +228,8 @@ function _build_gateway_config(raw::Dict{String,Any})
         _parse_gateway_sched_models(sched),
         _opt(wc, "max_concurrent_streams", Int, 32),
         _opt(grpc, "max_concurrent_requests_per_worker", Int, 64),
+        compaction_mode,
+        _opt(sched, "compaction_interval", Int, 0),
     )
     cfg.max_concurrent_streams_per_worker > 0 ||
         throw(ConfigError("worker_client.max_concurrent_streams must be positive"))
@@ -230,6 +244,7 @@ function _build_gateway_config(raw::Dict{String,Any})
     0 <= cfg.hysteresis < 1 || throw(ConfigError("scheduling.hysteresis must be in [0, 1)"))
     cfg.rate_halflife_seconds > 0 || throw(ConfigError("scheduling.rate_halflife_seconds must be positive"))
     cfg.routing_fill_factor > 0 || throw(ConfigError("scheduling.routing_fill_factor must be positive"))
+    cfg.compaction_interval >= 0 || throw(ConfigError("scheduling.compaction_interval must be non-negative (0 = disabled)"))
 
     if !isempty(_opt(tls, "cert_file", String, "")) || !isempty(_opt(tls, "key_file", String, ""))
         @warn "gateway TLS is configured but not yet enforced; serving cleartext h2c"
@@ -238,6 +253,14 @@ function _build_gateway_config(raw::Dict{String,Any})
     isempty(cfg.workers) && throw(ConfigError("gateway has no endpoints; set 'endpoints:' in gateway.yml or REACTANT_GATEWAY_WORKERS"))
     isempty(applied) || @info "gateway configuration overridden by environment" overrides = applied
     return cfg
+end
+
+function _parse_gateway_compaction_mode(s)
+    ls = lowercase(strip(s))
+    ls == "off" && return :off
+    ls == "eager" && return :eager
+    ls == "scheduled" && return :scheduled
+    throw(ConfigError("scheduling.compaction_mode must be 'off', 'eager', or 'scheduled', got '$s'"))
 end
 
 # Parse a replica count: a positive integer, or the string "all" (every ready worker, stored as
