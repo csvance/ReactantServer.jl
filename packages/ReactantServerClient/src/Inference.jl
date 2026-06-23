@@ -148,8 +148,8 @@ end
 
 Carve one input buffer per named spec from the chunk's `slot`, advancing its cursor so the buffers
 occupy disjoint, contiguous byte ranges, and return the wire descriptors ready to hand back from
-[`infer_encode_chunk!`](@ref). `dims` is the Julia column-major shape (per-item dims then the batch
-axis), or a bare integer for a vector. Get the writable views with [`pool_view`](@ref): one
+`infer_encode_chunk!`. `dims` is the Julia column-major shape (per-item dims then the batch
+axis), or a bare integer for a vector. Get the writable views with `pool_view`: one
 descriptor returns one view, and splatting the vector returns all of them to destructure at once.
 
 ```julia

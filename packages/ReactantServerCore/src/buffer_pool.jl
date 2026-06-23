@@ -286,7 +286,7 @@ pool_fsa(slot::PoolSlot, ::Type{T}, dims::Vararg{Integer,N}) where {T,N} = pool_
 
 Carve one typed buffer per `dims => T` spec from `slot` in a single call, advancing the slot's
 cursor so the buffers occupy disjoint, contiguous byte ranges. Each buffer is an `Array{T}`
-aliasing the pool's backing (via [`pool_view`](@ref); zero-copy, and uniform across SHM- and
+aliasing the pool's backing (via `pool_view`; zero-copy, and uniform across SHM- and
 `Memory`-backed pools since it is just `pool_base + offset`); write into the returned arrays
 directly. `dims` is a shape tuple (or a bare integer for a vector).
 
