@@ -619,11 +619,22 @@ end
 # (0 when the backend reports no device stats, e.g. CPU/mock).
 function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
     (s.weight_cache === nothing || device_memory_stats(s.backend, s.pool) === nothing) && return 0
+    # `peak_in_use` is the allocator's monotonic session high-water mark, and we cannot reset it between
+    # models, so a naive `peak - (pinned + this_model.nbytes)` leaks the heaviest model's weights into
+    # every later model's "scratch" and depends on iteration order (non-deterministic, over-reserving).
+    # Two changes make the estimate deterministic AND exact: (1) probe in ascending weight order, and
+    # (2) subtract the largest weight set resident so far. In ascending order the running max weight is
+    # the current model's weight, and `max_i (peak_i - pinned - maxweight_i)` is then provably exactly
+    # `max_i scratch_i`, the worst single-model transient: peak_i >= pinned + W_i + S_i gives the >= S_i
+    # bound, and W_j <= W_i for all j <= i gives the <= max(S) bound. No peak reset required.
+    probe = [e for e in values(s.registry.by_name)
+             if e.executable !== nothing && !is_device_pinned(e.executable) &&
+                !isempty(e.manifest.executable_inputs)]          # need synthesizable inputs to measure
+    sort!(probe; by = e -> e.executable.nbytes)                  # ascending weight
     max_scratch = 0
-    for entry in values(s.registry.by_name)
+    max_weight = 0
+    for entry in probe
         model = entry.executable
-        (model === nothing || is_device_pinned(model)) && continue
-        isempty(entry.manifest.executable_inputs) && continue   # cannot synthesize inputs
         _free_nonpinned!(s.weight_cache)                         # isolate: only pinned + M will be resident
         try
             acquire!(s.weight_cache, entry)
@@ -631,6 +642,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
             err isa NotResidentError && continue                 # externally-managed: cannot load to measure
             rethrow()
         end
+        max_weight = max(max_weight, model.nbytes)               # == model.nbytes given ascending order
         for (variant, inner) in model.execs
             for sz in keys(inner)
                 inputs = _zero_inputs(entry, variant, sz)
@@ -646,7 +658,7 @@ function _probe_max_scratch!(s::Scheduler, pinned_bytes::Int)
         end
         dm = device_memory_stats(s.backend, s.pool)
         dm === nothing && continue
-        max_scratch = max(max_scratch, dm.peak_in_use - (pinned_bytes + model.nbytes))
+        max_scratch = max(max_scratch, dm.peak_in_use - (pinned_bytes + max_weight))
     end
     return max(0, max_scratch)
 end
