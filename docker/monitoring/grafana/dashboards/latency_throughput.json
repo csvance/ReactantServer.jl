@@ -4,7 +4,7 @@
   "tags": ["reactantserver", "red", "latency"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "time": { "from": "now-3h", "to": "now" },
   "templating": {
@@ -16,8 +16,8 @@
   "panels": [
     {
       "type": "heatmap",
-      "title": "Request latency distribution (gateway)",
-      "description": "The full latency distribution over time from the histogram buckets, the shape, not just a p99 line. Bright bands show where most requests land; a creeping upper band is tail latency growing.",
+      "title": "Request latency distribution (gateway, end-to-end)",
+      "description": "Gateway-internal end-to-end latency distribution (route + worker round-trip + worker handler), from the histogram buckets. The full shape over time, not just a p99 line.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
       "options": { "calculate": false, "cellGap": 1, "color": { "mode": "scheme", "scheme": "Spectral", "reverse": true, "steps": 64 }, "yAxis": { "unit": "s" }, "tooltip": { "show": true, "yHistogram": true }, "legend": { "show": true } },
@@ -25,7 +25,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Latency percentiles",
+      "title": "Latency percentiles (gateway, end-to-end)",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 9 },
       "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8 } } },
@@ -48,27 +48,64 @@
     },
     {
       "type": "timeseries",
-      "title": "Queue-wait latency by worker",
-      "description": "Per-model queue-wait quantiles aggregated to the worst per worker (max over models). Rising wait = the GPU is the bottleneck for that worker.",
+      "title": "Queue-wait p50 by worker",
+      "description": "Median per-model queue wait, worst model per worker. The typical time a request sits before the GPU picks it up.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 1, "fillOpacity": 6 } } },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } } },
       "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [
-        { "refId": "p99", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max by (worker) (worker_queue_wait_seconds{quantile=\"0.99\", worker=~\"$worker\"})", "legendFormat": "{{worker}} p99" },
-        { "refId": "p50", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max by (worker) (worker_queue_wait_seconds{quantile=\"0.5\", worker=~\"$worker\"})", "legendFormat": "{{worker}} p50" }
-      ]
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max by (worker) (worker_queue_wait_seconds{quantile=\"0.5\", worker=~\"$worker\"})", "legendFormat": "{{worker}}" } ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue-wait p99 by worker",
+      "description": "Tail per-model queue wait, worst model per worker. Rising p99 = the GPU is the bottleneck and requests are backing up.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max by (worker) (worker_queue_wait_seconds{quantile=\"0.99\", worker=~\"$worker\"})", "legendFormat": "{{worker}}" } ]
     },
     {
       "type": "table",
       "title": "Top models by request rate",
-      "description": "Highest-traffic models right now. A table beats 94 overlaid lines.",
+      "description": "Highest-traffic models right now.",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 16 },
-      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "align": "auto", "filterable": true } }, "overrides": [ { "matcher": { "id": "byName", "options": "model" }, "properties": [ { "id": "custom.width", "value": 320 } ] } ] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "align": "auto", "filterable": true } } },
       "options": { "showHeader": true, "sortBy": [ { "displayName": "req/s", "desc": true } ] },
       "targets": [ { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "topk(15, sum by (model) (rate(gateway_requests_total[$__rate_interval])))", "format": "table", "instant": true } ],
-      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "Value": false }, "renameByName": { "Value": "req/s" } } } ]
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "Value": "req/s" } } } ]
+    },
+    {
+      "type": "table",
+      "title": "Per-model latency & GPU cost (worst offenders)",
+      "description": "Per model: req/s, average GPU compute per dispatch (pure GPU time = compute-heaviness), and worker-side handler-latency percentiles p50/p95/p99 (queue + GPU + pre/post). Sorted by p99. The gap between p99 and GPU/disp is queue + overhead, not the model being heavy. Idle models excluded.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "model" }, "properties": [ { "id": "custom.width", "value": 360 } ] },
+          { "matcher": { "id": "byName", "options": "req/s" }, "properties": [ { "id": "unit", "value": "reqps" }, { "id": "decimals", "value": 2 } ] },
+          { "matcher": { "id": "byName", "options": "GPU/disp" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 0.25 }, { "color": "red", "value": 1 } ] } } ] },
+          { "matcher": { "id": "byName", "options": "p50" }, "properties": [ { "id": "unit", "value": "s" } ] },
+          { "matcher": { "id": "byName", "options": "p95" }, "properties": [ { "id": "unit", "value": "s" } ] },
+          { "matcher": { "id": "byName", "options": "p99" }, "properties": [ { "id": "unit", "value": "s" }, { "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 0.5 }, { "color": "red", "value": 2 } ] } } ] }
+        ]
+      },
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "p99", "desc": true } ] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0", "format": "table", "instant": true },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (model) (rate(worker_compute_seconds_total[$__rate_interval])) / clamp_min(sum by (model) (rate(worker_dispatch_total[$__rate_interval])), 1e-9) and on (model) (sum by (model) (rate(worker_dispatch_total[$__rate_interval])) > 0)", "format": "table", "instant": true },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true },
+        { "refId": "D", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true },
+        { "refId": "E", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (model, le) (rate(worker_request_latency_seconds_bucket[$__rate_interval]))) and on (model) (sum by (model) (rate(worker_request_latency_seconds_count[$__rate_interval])) > 0)", "format": "table", "instant": true }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "Value #A": "req/s", "Value #B": "GPU/disp", "Value #C": "p50", "Value #D": "p95", "Value #E": "p99" } } }
+      ]
     }
   ]
 }
