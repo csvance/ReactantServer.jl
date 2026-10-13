@@ -115,6 +115,20 @@ maximum(abs, io.outputs .- first(model(data, ps, st)))      # ≈ 0
 # requires shared memory and fails loudly without it, and `:off` always sends inline. Both paths
 # give the same results:
 
+let shm = ReactantServerClient._shm_pool[] #src
+    if shm === nothing #src
+        @error "diag: no SHM pool was created" #src
+    else #src
+        IPC = parentmodule(typeof(shm.pool.backing)) #src
+        name = String(ReactantServerClient.shmid(shm.pool.backing)) #src
+        try #src
+            IPC.SharedMemory(name; readonly = true) #src
+            @info "diag: read-only open succeeded" name #src
+        catch ex #src
+            @error "diag: read-only open failed" name len = length(name) exception = (ex, catch_backtrace()) #src
+        end #src
+    end #src
+end #src
 @test ReactantServerClient.is_shm_backed(ReactantServerClient.get_or_create_pool!(mlp)) #src
 
 inline = KServeModel("grpc://127.0.0.1:8001", "mlp"; max_batch_size = 8, shared_memory = :off)
